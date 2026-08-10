@@ -1,10 +1,17 @@
-//! This crate contains all shared UI for the workspace.
+//! Shared Vesper GUI: the Dioxus component tree, mock data layer, and the
+//! `VesperClient` trait that lets a future Matrix integration replace the
+//! mock data without touching any component.
 
-mod hero;
-pub use hero::Hero;
+mod app;
+pub use app::App;
 
-mod navbar;
-pub use navbar::Navbar;
+pub mod data;
 
-mod echo;
-pub use echo::Echo;
+mod icons;
+mod markdown;
+mod window_chrome;
+
+mod design_system;
+
+mod chat;
+mod screens;

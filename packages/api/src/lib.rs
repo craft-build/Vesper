@@ -1,8 +1,4 @@
 //! This crate contains all shared fullstack server functions.
-use dioxus::prelude::*;
-
-/// Echo the user input on the server.
-#[post("/api/echo")]
-pub async fn echo(input: String) -> Result<String, ServerFnError> {
-    Ok(input)
-}
+//!
+//! Reserved for future Matrix-backed server functions (e.g. a homeserver proxy).
+//! Nothing lives here yet — `ui`'s data layer is client-side only for now.

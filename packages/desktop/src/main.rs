@@ -1,54 +1,22 @@
-use dioxus::prelude::*;
-
-use ui::Navbar;
-use views::{Blog, Home};
-
-mod views;
-
-#[derive(Debug, Clone, Routable, PartialEq)]
-#[rustfmt::skip]
-enum Route {
-    #[layout(DesktopNavbar)]
-    #[route("/")]
-    Home {},
-    #[route("/blog/:id")]
-    Blog { id: i32 },
-}
-
-const MAIN_CSS: Asset = asset!("/assets/main.css");
+use dioxus::desktop::{Config, WindowBuilder};
 
 fn main() {
-    dioxus::launch(App);
-}
+    // Fully borderless on every platform: the app draws its own window controls
+    // (see `window_chrome` in the ui crate) — a single `_ / ▢ / ×` cluster at
+    // the top-right of every screen.
+    let mut window = WindowBuilder::new()
+        .with_title("Vesper")
+        .with_decorations(false);
 
-#[component]
-fn App() -> Element {
-    // Build cool things ✌️
-
-    rsx! {
-        // Global app resources
-        document::Link { rel: "stylesheet", href: MAIN_CSS }
-
-        Router::<Route> {}
+    // macOS: borderless windows are sharp-cornered by default. Make the window
+    // transparent so the app can paint its own rounded corners via CSS on the
+    // root container (matching the native macOS window look).
+    #[cfg(target_os = "macos")]
+    {
+        window = window.with_transparent(true);
     }
-}
 
-/// A desktop-specific Router around the shared `Navbar` component
-/// which allows us to use the desktop-specific `Route` enum.
-#[component]
-fn DesktopNavbar() -> Element {
-    rsx! {
-        Navbar {
-            Link {
-                to: Route::Home {},
-                "Home"
-            }
-            Link {
-                to: Route::Blog { id: 1 },
-                "Blog"
-            }
-        }
-
-        Outlet::<Route> {}
-    }
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(Config::new().with_window(window))
+        .launch(ui::App);
 }
