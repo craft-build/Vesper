@@ -6,6 +6,29 @@
 //! off and never link matrix-sdk.
 
 use crate::model::*;
+use dioxus_signals::{Signal, SyncStorage};
+
+/// Live UI-visible state written by backend sync tasks and read reactively by
+/// components.
+///
+/// The signals use [`SyncStorage`] so they can safely be written from the
+/// backend's dedicated tokio runtime thread: Dioxus' default `Signal<T>`
+/// storage is thread-local and would fail off-thread, while sync-signal
+/// writes are direct in-place writes that mark subscribers dirty through the
+/// (cross-thread-safe) Dioxus scheduler channel. The signals must be created
+/// in a component scope that outlives any sync task — the root `App` scope,
+/// which lives for the app lifetime — otherwise a write after scope disposal
+/// panics the writer (docs/03-sync-roomlist.md, "Signal ownership problem").
+/// If that panic ever surfaces, fall back to an mpsc channel drained by a
+/// `use_coroutine` on the UI side.
+#[derive(Clone, Copy)]
+pub struct ClientState {
+    /// The unified DM + room list, ordered by recency as produced by sync.
+    pub convos: Signal<Vec<Convo>, SyncStorage>,
+    /// True while the sync is catching up, reconnecting, or offline; the
+    /// shell shows a subtle hint.
+    pub connecting: Signal<bool, SyncStorage>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientError(pub String);
@@ -50,8 +73,18 @@ pub trait VesperClient {
     /// The signed-in account snapshot, if any.
     async fn me(&self) -> Option<Me>;
 
+    /// Hand the UI's live state handles to the backend. Called once from the
+    /// root `App` scope after the signals exist; must be idempotent
+    /// (component bodies can re-run). Background sync tasks write into these
+    /// signals so components re-render live.
+    fn bind_state(&self, state: ClientState);
+
     async fn spaces(&self) -> Vec<Space>;
     /// Direct messages and rooms combined, mirroring the prototype's `[...dms, ...rooms]`.
+    ///
+    /// With the real backend this is the latest synced snapshot (empty until
+    /// the first sync batch lands); components that want live updates should
+    /// read [`ClientState::convos`] instead.
     async fn conversations(&self) -> Vec<Convo>;
 
     async fn messages(&self, convo_id: &str) -> Vec<Message>;

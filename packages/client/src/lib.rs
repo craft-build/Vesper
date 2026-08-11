@@ -13,13 +13,17 @@ pub mod model;
 pub mod runtime;
 #[cfg(feature = "matrix")]
 mod session;
+#[cfg(feature = "matrix")]
+pub mod sync;
 
 #[cfg(feature = "matrix")]
 mod matrix_impl {
+    use std::sync::{Arc, RwLock};
+
     use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
     use crate::{
-        api::{ClientError, VesperClient},
+        api::{ClientError, ClientState, VesperClient},
         model::*,
         runtime::{ClientRuntime, Command},
     };
@@ -31,6 +35,10 @@ mod matrix_impl {
     /// lives on the runtime thread; see docs/00-roadmap.md §3.
     pub struct MatrixClient {
         tx: UnboundedSender<Command>,
+        // Latest synced conversations; the runtime's sync task writes it and
+        // `conversations()` clones it. Kept identical to the bound
+        // `ClientState::convos` signal.
+        snapshot: Arc<RwLock<Vec<Convo>>>,
         // Keep the runtime alive for as long as we might send commands.
         _runtime: ClientRuntime,
     }
@@ -47,6 +55,7 @@ mod matrix_impl {
             let (runtime, tx) = ClientRuntime::spawn();
             Self {
                 tx,
+                snapshot: Arc::new(RwLock::new(Vec::new())),
                 _runtime: runtime,
             }
         }
@@ -106,11 +115,25 @@ mod matrix_impl {
             reply_rx.await.ok().flatten()
         }
 
+        fn bind_state(&self, state: ClientState) {
+            // The runtime's sync task will publish directly into `state`'s
+            // sync-storage signals from the tokio thread — legal because
+            // they're Send+Sync handles (see `api::ClientState` docs).
+            let _ = self.tx.send(Command::BindState {
+                state,
+                snapshot: self.snapshot.clone(),
+            });
+        }
+
         async fn spaces(&self) -> Vec<Space> {
-            Self::empty_vec("spaces")
+            // Spaces are checkpoint 09.
+            Vec::new()
         }
         async fn conversations(&self) -> Vec<Convo> {
-            Self::empty_vec("conversations")
+            self.snapshot
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
         async fn messages(&self, _convo_id: &str) -> Vec<Message> {
             Self::empty_vec("messages")

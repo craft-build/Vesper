@@ -1,9 +1,8 @@
-
 use dioxus::document;
 use dioxus::prelude::*;
 
 use crate::chat::{AppShell, ChatUiState, ChatView, DiscoveryModal};
-use crate::data::{self, Me};
+use crate::data::{self, ClientState, Convo, Me};
 use crate::screens::{LoginScreen, SettingsScreen};
 
 const STYLES: Asset = asset!("/assets/vesper/styles.css");
@@ -30,6 +29,20 @@ pub fn App() -> Element {
     use_context_provider(|| client.clone());
     use_context_provider(ChatUiState::new);
     let mut me = use_context_provider(|| Signal::new(Option::<Me>::None));
+
+    // Live backend state, written by sync tasks that run on the Matrix
+    // runtime thread. These MUST be sync-storage signals: the default
+    // `Signal::<T>::new` storage is thread-local and would fail when written
+    // off the UI thread. Provided as context and handed to the backend, which
+    // publishes into them (idempotent — re-run bodies re-bind harmlessly).
+    let convos = use_signal_sync(Vec::<Convo>::new);
+    let connecting = use_signal_sync(|| false);
+    let sync_state = ClientState { convos, connecting };
+    use_context_provider(|| sync_state);
+    use_effect({
+        let client = client.clone();
+        move || client.bind_state(sync_state)
+    });
 
     // Before the login screen paints, try to restore a persisted session.
     // `Ok(None)` = no stored session (normal first run); `Err` = a stored
@@ -87,6 +100,7 @@ fn Splash() -> Element {
 #[component]
 fn Shell() -> Element {
     let mut ui = use_context::<ChatUiState>();
+    let sync = use_context::<ClientState>();
 
     use_effect(move || {
         spawn(async move {
@@ -131,6 +145,11 @@ fn Shell() -> Element {
     rsx! {
         AppShell {
             Outlet::<Route> {}
+        }
+        if (sync.connecting)() {
+            div { style: "position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:50;background:var(--bg-surface-raised);border:1px solid var(--border-subtle);color:var(--text-secondary);font-size:12px;padding:4px 12px;border-radius:999px;",
+                "Connecting…"
+            }
         }
         if (ui.discovery_open)() {
             DiscoveryModal { on_close: move |_| ui.discovery_open.set(false) }

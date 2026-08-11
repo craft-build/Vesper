@@ -763,7 +763,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dioxus-signals",
  "directories",
+ "eyeball-im",
+ "futures",
  "matrix-sdk",
  "matrix-sdk-ui",
  "serde",

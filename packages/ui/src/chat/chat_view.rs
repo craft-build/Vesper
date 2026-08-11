@@ -10,7 +10,7 @@ use super::switcher::Switcher;
 use super::thread_panel::ThreadPanel;
 use super::{CallScreen, CallState, ChatUiState, ProfileTarget, SidePanel};
 use crate::app::Route;
-use crate::data::{ConvoKind, VesperClient};
+use crate::data::{ClientState, ConvoKind, VesperClient};
 use crate::icons::Icon;
 use crate::window_chrome::{DragStrip, WindowControls};
 
@@ -20,14 +20,10 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
     let mut ui = use_context::<ChatUiState>();
     let navigator = use_navigator();
 
-    let convos = {
-        let client = client.clone();
-        use_resource(move || {
-            let client = client.clone();
-            async move { client.conversations().await }
-        })
-    };
-    let all_convos = convos().unwrap_or_default();
+    // Live list: written by the backend's sync task (checkpoint 03), so the
+    // drawer and switcher re-render as rooms/unread counts change — no fetch.
+    let sync = use_context::<ClientState>();
+    let all_convos = (sync.convos)();
 
     let dms: Vec<_> = all_convos
         .iter()

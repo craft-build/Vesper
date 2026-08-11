@@ -10,17 +10,26 @@
 //! non-`Send` ever crosses the bridge — the channel payloads are plain data by
 //! construction (see docs/00-roadmap.md §3).
 //!
-//! Checkpoint 02 commands: `Login`, `Restore`, `Logout` (auth + session
-//! persistence) and `Ping` for the round-trip sanity check.
+//! Checkpoint 02/03 commands: `Login`, `Restore`, `Logout` (auth + session
+//! persistence), `Ping` for the round-trip sanity check, and `BindState`
+//! which hands the UI's live signals in so room-list sync can publish into
+//! them.
+
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
+use dioxus_signals::WritableExt;
 use matrix_sdk::Client;
 use tokio::{
     runtime::Runtime,
     sync::{mpsc::UnboundedSender, oneshot},
 };
 
-use crate::{api::ClientError, model::Me, session};
+use crate::{
+    api::{ClientError, ClientState},
+    model::{Convo, Me},
+    session, sync,
+};
 
 /// Commands the UI can send into the Matrix runtime.
 ///
@@ -53,6 +62,40 @@ pub enum Command {
     },
     /// The cached identity snapshot, if a session is active.
     WhoAmI { reply: oneshot::Sender<Option<Me>> },
+    /// Hand the UI-created live state to the runtime so sync can publish into
+    /// it. `snapshot` belongs to `MatrixClient` and backs `conversations()`;
+    /// the sync task keeps it identical to `state.convos`. Arrives once after
+    /// the Dioxus scope exists — before or after login, either is fine.
+    BindState {
+        state: ClientState,
+        snapshot: Arc<RwLock<Vec<Convo>>>,
+    },
+}
+
+/// (Re)start the room-list sync once both halves exist: an authenticated
+/// client and the UI-bound state. A previously running sync is stopped first,
+/// so a login/rebind never stacks two of them.
+async fn restart_sync(
+    sdk_client: &Option<Client>,
+    bound: &Option<(ClientState, Arc<RwLock<Vec<Convo>>>)>,
+    current: &mut Option<sync::SyncHandles>,
+) {
+    if let Some(handles) = current.take() {
+        handles.stop().await;
+    }
+    let (Some(client), Some((state, snapshot))) = (sdk_client, bound) else {
+        return;
+    };
+    match sync::start_room_list(client.clone(), *state, snapshot.clone()).await {
+        Ok(handles) => *current = Some(handles),
+        Err(e) => {
+            tracing::warn!("room list sync failed to start: {}", e.0);
+            // Don't strand the user at a permanently empty list: leave the
+            // "connecting…" pill on so a non-delivering sync reads as one.
+            let mut state = *state;
+            state.connecting.set(true);
+        }
+    }
 }
 
 /// Owns the tokio runtime that matrix-sdk code runs on.
@@ -73,6 +116,10 @@ impl ClientRuntime {
                     // The SDK client lives and dies inside this task.
                     let mut sdk_client: Option<Client> = None;
                     let mut me: Option<Me> = None;
+                    // UI-bound live state (arrives via `BindState`) and the
+                    // running room-list sync built from it + the client.
+                    let mut bound: Option<(ClientState, Arc<RwLock<Vec<Convo>>>)> = None;
+                    let mut sync: Option<sync::SyncHandles> = None;
 
                     while let Some(cmd) = rx.recv().await {
                         match cmd {
@@ -91,9 +138,12 @@ impl ClientRuntime {
                                     session::connect_login(homeserver, user_id, password).await;
                                 match result {
                                     Ok((client, snapshot)) => {
+                                        // Reply first, then start sync: the
+                                        // caller's await shouldn't wait on it.
                                         sdk_client = Some(client);
                                         me = Some(snapshot.clone());
                                         let _ = reply.send(Ok(snapshot));
+                                        restart_sync(&sdk_client, &bound, &mut sync).await;
                                     }
                                     Err(e) => {
                                         let _ = reply.send(Err(e));
@@ -105,6 +155,7 @@ impl ClientRuntime {
                                     sdk_client = Some(client);
                                     me = Some(snapshot.clone());
                                     let _ = reply.send(Ok(Some(snapshot)));
+                                    restart_sync(&sdk_client, &bound, &mut sync).await;
                                 }
                                 Ok(None) => {
                                     let _ = reply.send(Ok(None));
@@ -114,6 +165,19 @@ impl ClientRuntime {
                                 }
                             },
                             Command::Logout { reply } => {
+                                // Stop sync before the session teardown drops
+                                // the client; then blank the UI's live state
+                                // so a later login never sees a stale list.
+                                if let Some(handles) = sync.take() {
+                                    handles.stop().await;
+                                }
+                                if let Some((state, snapshot)) = &bound {
+                                    *snapshot.write().unwrap_or_else(|e| e.into_inner()) =
+                                        Vec::new();
+                                    let mut state = *state;
+                                    state.convos.set(Vec::new());
+                                    state.connecting.set(false);
+                                }
                                 // Take the client (by value) so the session
                                 // module can drop it — closing sqlite handles —
                                 // before deleting the store dir.
@@ -123,6 +187,10 @@ impl ClientRuntime {
                             }
                             Command::WhoAmI { reply } => {
                                 let _ = reply.send(me.clone());
+                            }
+                            Command::BindState { state, snapshot } => {
+                                bound = Some((state, snapshot));
+                                restart_sync(&sdk_client, &bound, &mut sync).await;
                             }
                         }
                     }

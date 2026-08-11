@@ -6,6 +6,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use dioxus::prelude::WritableExt;
+
 use crate::data::*;
 
 struct MockState {
@@ -486,6 +488,13 @@ impl VesperClient for MockClient {
 
     async fn me(&self) -> Option<Me> {
         Some(self.state.borrow().me.clone())
+    }
+
+    fn bind_state(&self, mut state: ClientState) {
+        // Mock has no live sync: seed the list once and never show
+        // "connecting". Mutations (send, react) touch messages, not convos.
+        state.convos.set(self.state.borrow().convos.clone());
+        state.connecting.set(false);
     }
 
     async fn spaces(&self) -> Vec<Space> {

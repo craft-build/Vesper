@@ -16,6 +16,8 @@ matrix = [
     "dep:directories",
     "dep:serde",
     "dep:serde_json",
+    "dep:eyeball-im",
+    "dep:futures",
 ]
 
 [dependencies]
@@ -28,6 +30,12 @@ tracing = { version = "0.1", optional = true }
 directories = { version = "6", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+# The backend publishes live data into Dioxus signals from the tokio runtime
+# thread; `dioxus-signals` alone (not full dioxus) is the lightweight seam for
+# that. Needed on wasm too, so NOT optional.
+dioxus-signals = "0.7"
+eyeball-im = { version = "0.8", optional = true }
+futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

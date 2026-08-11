@@ -11,7 +11,7 @@ use std::rc::Rc;
 mod mock;
 
 pub use client::{
-    api::{ClientError, VesperClient},
+    api::{ClientError, ClientState, VesperClient},
     model::*,
 };
 pub use mock::MockClient;
