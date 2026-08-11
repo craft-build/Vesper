@@ -65,32 +65,11 @@ pub fn DragStrip() -> Element {
 pub fn WindowControls() -> Element {
     #[cfg(feature = "desktop")]
     {
-        let mut close_hover = use_signal(|| false);
-        let mut max_hover = use_signal(|| false);
-        let mut min_hover = use_signal(|| false);
-
-        const BTN: &str = "width:38px;height:30px;border:none;cursor:default;display:flex;align-items:center;justify-content:center;border-radius:var(--radius-md);background:transparent;color:var(--text-secondary);";
-        const BTN_HOVER: &str = "background:var(--bg-hover);color:var(--text-primary);";
-
+        // Hover styling is in the .win-btn classes: dynamic style strings get
+        // corrupted by dioxus's style patching when hover signals change.
         let window = dioxus::desktop::use_window();
         let minimize = window.clone();
         let maximize = window.clone();
-
-        let min_style = if min_hover() {
-            format!("{BTN}{BTN_HOVER}")
-        } else {
-            BTN.to_string()
-        };
-        let max_style = if max_hover() {
-            format!("{BTN}{BTN_HOVER}")
-        } else {
-            BTN.to_string()
-        };
-        let close_style = if close_hover() {
-            format!("{BTN}background:var(--status-danger);color:#fff;")
-        } else {
-            BTN.to_string()
-        };
 
         rsx! {
             div {
@@ -98,30 +77,24 @@ pub fn WindowControls() -> Element {
                 button {
                     title: "Minimize",
                     "aria-label": "Minimize",
-                    style: "{min_style}",
+                    class: "win-btn",
                     onmousedown: move |evt| evt.stop_propagation(),
-                    onmouseenter: move |_| min_hover.set(true),
-                    onmouseleave: move |_| min_hover.set(false),
                     onclick: move |_| minimize.window.set_minimized(true),
                     Icon { name: IconName::Minus, size: 15 }
                 }
                 button {
                     title: "Maximize",
                     "aria-label": "Maximize",
-                    style: "{max_style}",
+                    class: "win-btn",
                     onmousedown: move |evt| evt.stop_propagation(),
-                    onmouseenter: move |_| max_hover.set(true),
-                    onmouseleave: move |_| max_hover.set(false),
                     onclick: move |_| maximize.toggle_maximized(),
                     Icon { name: IconName::Square, size: 13 }
                 }
                 button {
                     title: "Close",
                     "aria-label": "Close",
-                    style: "{close_style}",
+                    class: "win-btn win-btn--close",
                     onmousedown: move |evt| evt.stop_propagation(),
-                    onmouseenter: move |_| close_hover.set(true),
-                    onmouseleave: move |_| close_hover.set(false),
                     onclick: move |_| window.close(),
                     Icon { name: IconName::X, size: 16 }
                 }

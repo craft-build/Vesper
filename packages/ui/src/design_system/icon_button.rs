@@ -8,34 +8,25 @@ pub fn IconButton(
     #[props(default = None)] onclick: Option<EventHandler<MouseEvent>>,
     children: Element,
 ) -> Element {
-    let mut hover = use_signal(|| false);
-    let bg = if active {
-        "var(--bg-selected)"
-    } else if hover() {
-        "var(--bg-hover)"
+    let class = if active {
+        "ds-icon-button ds-icon-button--active"
     } else {
-        "transparent"
+        "ds-icon-button"
     };
-    let color = if active {
-        "var(--text-brand)"
-    } else {
-        "var(--text-secondary)"
-    };
-    let style = format!(
-        "width:{size}px;height:{size}px;border-radius:var(--radius-md);border:none;display:flex;align-items:center;justify-content:center;background:{bg};color:{color};cursor:pointer;transition:background var(--duration-fast) var(--ease-standard);"
-    );
+    // Size stays a custom property instead of a class: it is per-instance
+    // data, and the style string never changes for interactive states.
+    let size_style = format!("--ds-icon-size:{size}px");
     rsx! {
         button {
+            class: "{class}",
+            style: "{size_style}",
             "aria-label": "{label}",
             title: "{label}",
-            style: "{style}",
             onclick: move |evt| {
                 if let Some(handler) = &onclick {
                     handler.call(evt);
                 }
             },
-            onmouseenter: move |_| hover.set(true),
-            onmouseleave: move |_| hover.set(false),
             {children}
         }
     }

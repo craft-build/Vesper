@@ -14,18 +14,18 @@ pub fn Select(
     #[props(default = Vec::new())] options: Vec<SelectOption>,
 ) -> Element {
     rsx! {
-        label { style: "display:flex;flex-direction:column;gap:6px;font-family:var(--font-sans);",
+        label { class: "ds-label",
             if let Some(label) = &label {
-                span { style: "font-size:13px;font-weight:500;color:var(--text-secondary);", "{label}" }
+                span { class: "ds-field-label", "{label}" }
             }
             select {
+                class: "ds-field",
                 value: "{value}",
                 onchange: move |evt| {
                     if let Some(handler) = &on_change {
                         handler.call(evt.value());
                     }
                 },
-                style: "font:14px var(--font-sans);color:var(--text-primary);background:var(--bg-surface);border:1px solid var(--border-default);border-radius:var(--radius-sm);padding:10px 12px;outline:none;",
                 for opt in options.iter() {
                     option { key: "{opt.value}", value: "{opt.value}", "{opt.label}" }
                 }

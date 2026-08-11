@@ -9,25 +9,21 @@ pub fn Input(
     #[props(default = None)] on_change: Option<EventHandler<String>>,
     #[props(default = None)] error: Option<String>,
 ) -> Element {
-    let mut focus = use_signal(|| false);
-    let border = if error.is_some() {
-        "var(--status-danger)".to_string()
-    } else if focus() {
-        "var(--border-brand)".to_string()
+    // Focus/error states come from CSS classes (see styles.css): reactive
+    // style-string updates get mangled by dioxus's style patching, which
+    // drops shorthand declarations containing var() on re-send.
+    let class = if error.is_some() {
+        "ds-field ds-field--error"
     } else {
-        "var(--border-default)".to_string()
-    };
-    let shadow = if focus() {
-        "var(--shadow-focus)"
-    } else {
-        "none"
+        "ds-field"
     };
     rsx! {
-        label { style: "display:flex;flex-direction:column;gap:6px;font-family:var(--font-sans);",
+        label { class: "ds-label",
             if let Some(label) = &label {
-                span { style: "font-size:13px;font-weight:500;color:var(--text-secondary);", "{label}" }
+                span { class: "ds-field-label", "{label}" }
             }
             input {
+                class: "{class}",
                 r#type: "{input_type}",
                 placeholder: "{placeholder}",
                 value: "{value}",
@@ -36,12 +32,9 @@ pub fn Input(
                         handler.call(evt.value());
                     }
                 },
-                onfocus: move |_| focus.set(true),
-                onblur: move |_| focus.set(false),
-                style: "font:14px var(--font-sans);color:var(--text-primary);background:var(--bg-surface);border:1px solid {border};border-radius:var(--radius-sm);padding:10px 12px;outline:none;box-shadow:{shadow};transition:box-shadow var(--duration-fast) var(--ease-standard), border-color var(--duration-fast) var(--ease-standard);",
             }
             if let Some(error) = &error {
-                span { style: "font-size:12px;color:var(--status-danger);", "{error}" }
+                span { class: "ds-error-msg", "{error}" }
             }
         }
     }

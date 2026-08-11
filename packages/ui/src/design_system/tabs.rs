@@ -13,22 +13,24 @@ pub fn Tabs(
     #[props(default = None)] on_change: Option<EventHandler<String>>,
 ) -> Element {
     rsx! {
-        div { style: "display:flex;gap:4px;border-bottom:1px solid var(--border-subtle);font-family:var(--font-sans);",
+        div { class: "ds-tabs",
             for tab in tabs.iter() {
                 {
                     let value = tab.value.clone();
-                    let is_active = active == tab.value;
-                    let color = if is_active { "var(--text-primary)" } else { "var(--text-tertiary)" };
-                    let border = if is_active { "var(--bg-brand)" } else { "transparent" };
+                    let class = if active == tab.value {
+                        "ds-tab ds-tab--active"
+                    } else {
+                        "ds-tab"
+                    };
                     rsx! {
                         button {
                             key: "{tab.value}",
+                            class: "{class}",
                             onclick: move |_| {
                                 if let Some(handler) = &on_change {
                                     handler.call(value.clone());
                                 }
                             },
-                            style: "background:none;border:none;cursor:pointer;padding:10px 14px;font-size:14px;font-weight:600;color:{color};border-bottom:2px solid {border};margin-bottom:-1px;transition:color var(--duration-fast) var(--ease-standard);",
                             "{tab.label}"
                         }
                     }

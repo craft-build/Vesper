@@ -6,19 +6,18 @@ pub fn Radio(
     #[props(default = false)] checked: bool,
     on_change: EventHandler<()>,
 ) -> Element {
-    let border = if checked {
-        "var(--bg-brand)"
+    let ring_class = if checked {
+        "ds-radio ds-radio--checked"
     } else {
-        "var(--border-strong)"
+        "ds-radio"
     };
     rsx! {
         label {
-            style: "display:flex;align-items:center;gap:10px;font-family:var(--font-sans);font-size:14px;color:var(--text-primary);cursor:pointer;",
+            class: "ds-check-label",
             onclick: move |_| on_change.call(()),
-            span {
-                style: "width:18px;height:18px;border-radius:var(--radius-full);flex-shrink:0;border:1px solid {border};display:flex;align-items:center;justify-content:center;",
+            span { class: "{ring_class}",
                 if checked {
-                    span { style: "width:9px;height:9px;border-radius:var(--radius-full);background:var(--bg-brand);" }
+                    span { class: "ds-radio-dot" }
                 }
             }
             "{label}"
