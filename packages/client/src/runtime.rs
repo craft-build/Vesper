@@ -29,6 +29,7 @@ use crate::{
     api::{ClientError, ClientState},
     model::{Convo, Me},
     session, sync,
+    timeline::TimelineRegistry,
 };
 
 /// Commands the UI can send into the Matrix runtime.
@@ -69,6 +70,18 @@ pub enum Command {
     BindState {
         state: ClientState,
         snapshot: Arc<RwLock<Vec<Convo>>>,
+    },
+    /// Open (refcounted) the live timeline for `room_id`; publishes mapped
+    /// messages into `state.messages`. Fire-and-forget: failures are logged,
+    /// the UI just sees an empty history (checkpoint 04).
+    OpenTimeline { room_id: String },
+    /// Release one reference to `room_id`'s timeline (disposing at zero).
+    CloseTimeline { room_id: String },
+    /// Back-paginate `room_id`'s open timeline by one page; replies with the
+    /// number of messages actually added.
+    LoadOlder {
+        room_id: String,
+        reply: oneshot::Sender<Result<usize, ClientError>>,
     },
 }
 
@@ -120,6 +133,9 @@ impl ClientRuntime {
                     // running room-list sync built from it + the client.
                     let mut bound: Option<(ClientState, Arc<RwLock<Vec<Convo>>>)> = None;
                     let mut sync: Option<sync::SyncHandles> = None;
+                    // Checkpoint 04: live timelines keyed by room id, disposed
+                    // when the last reader closes (or on logout below).
+                    let mut timelines = TimelineRegistry::default();
 
                     while let Some(cmd) = rx.recv().await {
                         match cmd {
@@ -178,6 +194,14 @@ impl ClientRuntime {
                                     state.convos.set(Vec::new());
                                     state.connecting.set(false);
                                 }
+                                // Timelines die with the session; blank their
+                                // published messages alongside the convo list
+                                // so a later login never paints stale history.
+                                timelines.abort_all();
+                                if let Some((state, _)) = &bound {
+                                    let mut state = *state;
+                                    state.messages.set(Default::default());
+                                }
                                 // Take the client (by value) so the session
                                 // module can drop it — closing sqlite handles —
                                 // before deleting the store dir.
@@ -191,6 +215,17 @@ impl ClientRuntime {
                             Command::BindState { state, snapshot } => {
                                 bound = Some((state, snapshot));
                                 restart_sync(&sdk_client, &bound, &mut sync).await;
+                            }
+                            Command::OpenTimeline { room_id } => {
+                                if let (Some(client), Some((state, _))) = (&sdk_client, &bound) {
+                                    timelines.open(client, &room_id, *state).await;
+                                }
+                            }
+                            Command::CloseTimeline { room_id } => {
+                                timelines.close(&room_id);
+                            }
+                            Command::LoadOlder { room_id, reply } => {
+                                let _ = reply.send(timelines.load_older(&room_id).await);
                             }
                         }
                     }

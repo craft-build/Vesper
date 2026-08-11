@@ -5,6 +5,8 @@
 //! (including its wasm target) can depend on this crate with default features
 //! off and never link matrix-sdk.
 
+use std::collections::BTreeMap;
+
 use crate::model::*;
 use dioxus_signals::{Signal, SyncStorage};
 
@@ -28,6 +30,13 @@ pub struct ClientState {
     /// True while the sync is catching up, reconnecting, or offline; the
     /// shell shows a subtle hint.
     pub connecting: Signal<bool, SyncStorage>,
+    /// Per-room message history published by the timeline tasks introduced in
+    /// checkpoint 04, keyed by room id, oldest first. One map signal (not
+    /// nested per-room signals) so new entries never need a new signal to be
+    /// created outside this struct's owner scope — see the lifecycle note
+    /// above. Reading from a component subscribes it to the whole map; the
+    /// timeline tasks replace the entry value on every diff batch.
+    pub messages: Signal<BTreeMap<String, Vec<Message>>, SyncStorage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +97,18 @@ pub trait VesperClient {
     async fn conversations(&self) -> Vec<Convo>;
 
     async fn messages(&self, convo_id: &str) -> Vec<Message>;
+
+    /// Open (refcounted) the live timeline for `convo_id`. The backend
+    /// publishes mapped messages into [`ClientState::messages`]; reopening an
+    /// already-open room is cheap (refcount only). Mock: no-op.
+    fn open_timeline(&self, convo_id: &str);
+    /// Close one reference to `convo_id`'s timeline. When the count reaches
+    /// zero the backend disposes the timeline task. Mock: no-op.
+    fn close_timeline(&self, convo_id: &str);
+    /// Back-paginate `convo_id`'s open timeline by one ~30-event page.
+    /// Returns the number of new messages actually added (0 when the start of
+    /// the timeline is reached or the timeline isn't open).
+    async fn load_older(&self, convo_id: &str) -> Result<usize, ClientError>;
     async fn thread(&self, message_id: &str) -> Vec<ThreadReply>;
 
     async fn send_message(

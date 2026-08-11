@@ -37,7 +37,14 @@ pub fn App() -> Element {
     // publishes into them (idempotent — re-run bodies re-bind harmlessly).
     let convos = use_signal_sync(Vec::<Convo>::new);
     let connecting = use_signal_sync(|| false);
-    let sync_state = ClientState { convos, connecting };
+    // Per-room timelines (checkpoint 04): one map signal, rooms added lazily
+    // as they are opened — see `ClientState::messages`.
+    let messages = use_signal_sync(std::collections::BTreeMap::<String, Vec<data::Message>>::new);
+    let sync_state = ClientState {
+        convos,
+        connecting,
+        messages,
+    };
     use_context_provider(|| sync_state);
     use_effect({
         let client = client.clone();

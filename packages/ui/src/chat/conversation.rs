@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 
 use super::composer::Composer;
 use super::message_row::MessageRow;
-use crate::data::{Convo, ConvoKind, VesperClient};
+use crate::data::{ClientState, Convo, ConvoKind, VesperClient};
 use crate::design_system::{Tag, TagTone};
 use crate::icons::{Icon, IconName};
 
@@ -20,8 +20,25 @@ pub fn Conversation(
     #[props(default = false)] hide_header: bool,
 ) -> Element {
     let client = use_context::<Rc<dyn VesperClient>>();
+    let mut sync = use_context::<ClientState>();
     let convo_id = convo.id.clone();
 
+    // Checkpoint 04: the real backend live-publishes this room's timeline into
+    // `sync.messages[convo_id]`; open/close are refcounted so leaving the room
+    // disposes the backend timeline task. The mock ignores both calls.
+    use_effect({
+        let client = client.clone();
+        let convo_id = convo_id.clone();
+        move || client.open_timeline(&convo_id)
+    });
+    use_drop({
+        let client = client.clone();
+        let convo_id = convo_id.clone();
+        move || client.close_timeline(&convo_id)
+    });
+
+    // Snapshot path: used by the mock backend (which never publishes the live
+    // map) and as first paint before the first timeline batch lands.
     let history = {
         let client = client.clone();
         let convo_id = convo_id.clone();
@@ -40,6 +57,30 @@ pub fn Conversation(
     });
 
     let mut replying_to = use_signal(|| None);
+    let mut loading_older = use_signal(|| false);
+    let mut anchored = use_signal(|| false);
+
+    // Back-pagination on scroll-to-top (checkpoint 04). Live rooms only — the
+    // mock serves its whole history up front.
+    let on_scroll = {
+        let client = client.clone();
+        let convo_id = convo_id.clone();
+        move |evt: dioxus::html::ScrollEvent| {
+            if evt.scroll_top() > 200.0
+                || loading_older()
+                || !sync.messages.read().contains_key(&convo_id)
+            {
+                return;
+            }
+            loading_older.set(true);
+            let client = client.clone();
+            let convo_id = convo_id.clone();
+            spawn(async move {
+                let _ = client.load_older(&convo_id).await;
+                loading_older.set(false);
+            });
+        }
+    };
 
     let send = {
         let client = client.clone();
@@ -61,7 +102,17 @@ pub fn Conversation(
                 attachment: attachment.clone(),
                 read_by: Vec::new(),
             };
-            messages.write().push(optimistic);
+            // Optimistic paint into whichever store is authoritative; the
+            // next live diff overwrites it (real pending state lands in 05).
+            if sync.messages.read().contains_key(&convo_id) {
+                sync.messages
+                    .write()
+                    .entry(convo_id.clone())
+                    .or_default()
+                    .push(optimistic);
+            } else {
+                messages.write().push(optimistic);
+            }
             replying_to.set(None);
 
             let client = client.clone();
@@ -78,7 +129,16 @@ pub fn Conversation(
         let client = client.clone();
         let convo_id = convo_id.clone();
         move |(message_id, emoji): (String, String)| {
-            messages.write().iter_mut().for_each(|m| {
+            let mut target = if sync.messages.read().contains_key(&convo_id) {
+                sync.messages
+                    .write()
+                    .entry(convo_id.clone())
+                    .or_default()
+                    .clone()
+            } else {
+                messages()
+            };
+            target.iter_mut().for_each(|m| {
                 if m.id != message_id {
                     return;
                 }
@@ -103,6 +163,11 @@ pub fn Conversation(
                     }),
                 }
             });
+            if sync.messages.read().contains_key(&convo_id) {
+                sync.messages.write().insert(convo_id.clone(), target);
+            } else {
+                messages.set(target);
+            }
 
             let client = client.clone();
             let convo_id = convo_id.clone();
@@ -121,10 +186,51 @@ pub fn Conversation(
         ConvoKind::Room => format!("{} members", convo.members.unwrap_or(0)),
         ConvoKind::Dm => convo.mxid.clone().unwrap_or_default(),
     };
-    let msgs = messages();
+    // Anchor at the newest message on first paint: the initial backfill
+    // loads a full page of history and without scrolling to the bottom the
+    // room opens on the OLDEST loaded message.
+    use_effect({
+        let convo_id = convo_id.clone();
+        move || {
+            let has = sync
+                .messages
+                .read()
+                .get(&convo_id)
+                .is_some_and(|v| !v.is_empty())
+                || !messages.read().is_empty();
+            if !has || anchored() {
+                return;
+            }
+            anchored.set(true);
+            // Double rAF: run after Dioxus commits the DOM and the browser
+            // has laid out the message list.
+            document::eval(
+                r#"
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                    const el = document.querySelector('[data-vesper-chat]');
+                    if (el) el.scrollTop = el.scrollHeight;
+                }));
+                "#,
+            );
+        }
+    });
+
+    // Live map entry wins when the backend has opened this room's timeline;
+    // otherwise the snapshot path (mock / first paint).
+    #[allow(clippy::redundant_closure)] // Signal isn't FnOnce; closure is load-bearing
+    let msgs = sync
+        .messages
+        .read()
+        .get(&convo_id)
+        .cloned()
+        .unwrap_or_else(|| messages());
 
     rsx! {
-        div { style: "flex:1;display:flex;flex-direction:column;min-width:0;height:100%;",
+        // flex:1 + min-height:0 (NOT height:100%): this root sits BELOW the
+        // focus header in a column flex, so height:100% would size it to the
+        // full parent and push the composer off-screen once the message list
+        // overflows. min-height:0 lets it shrink to the remaining space.
+        div { style: "flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;",
             if !hide_header {
                 div { style: "height:56px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;justify-content:space-between;padding:0 16px;flex-shrink:0;gap:8px;",
                     div { style: "display:flex;align-items:center;gap:8px;min-width:0;",
@@ -177,7 +283,14 @@ pub fn Conversation(
                     }
                 }
             }
-            div { style: "flex:1;overflow-y:auto;padding:20px 24px;display:flex;flex-direction:column;gap:16px;",
+            // min-height:0 is load-bearing: without it a flex child defaulting
+            // to min-height:auto grows past the conversation height and pushes
+            // the composer off-screen once the history fills a page.
+            div { style: "flex:1;min-height:0;overflow-y:auto;padding:20px 24px;display:flex;flex-direction:column;gap:16px;", onscroll: on_scroll,
+                "data-vesper-chat": true,
+                if loading_older() {
+                    div { style: "text-align:center;font-size:12px;color:var(--text-tertiary);font-family:var(--font-mono);padding:4px 0;", "Loading older…" }
+                }
                 for m in msgs.iter() {
                     MessageRow {
                         key: "{m.id}",

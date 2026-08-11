@@ -514,6 +514,15 @@ impl VesperClient for MockClient {
             .unwrap_or_default()
     }
 
+    // Mock has no live timelines (checkpoint 04): the snapshot `messages()`
+    // path stays authoritative and nothing is published into
+    // `ClientState::messages`.
+    fn open_timeline(&self, _convo_id: &str) {}
+    fn close_timeline(&self, _convo_id: &str) {}
+    async fn load_older(&self, _convo_id: &str) -> Result<usize, ClientError> {
+        Ok(0)
+    }
+
     async fn thread(&self, message_id: &str) -> Vec<ThreadReply> {
         self.state
             .borrow()

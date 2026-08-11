@@ -140,7 +140,7 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                     inline: true,
                 }
             }
-            div { key: "{active_id}", style: "flex:1;display:flex;flex-direction:column;min-width:0;",
+            div { key: "{active_id}", style: "flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;",
                 if let Some(c) = &convo {
                     FocusHeader {
                         convo: c.clone(),

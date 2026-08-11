@@ -6,6 +6,7 @@
 //! linking matrix-sdk; everything SDK-touching sits behind the `matrix`
 //! feature (on by default for native builds).
 
+#![recursion_limit = "512"]
 pub mod api;
 pub mod model;
 
@@ -15,6 +16,8 @@ pub mod runtime;
 mod session;
 #[cfg(feature = "matrix")]
 pub mod sync;
+#[cfg(feature = "matrix")]
+pub mod timeline;
 
 #[cfg(feature = "matrix")]
 mod matrix_impl {
@@ -135,8 +138,28 @@ mod matrix_impl {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
         }
+        // Snapshot read-back for first paint comes from the live map; a room
+        // that was never opened yields an empty history until `open_timeline`
+        // (called by the Conversation component) publishes into it.
         async fn messages(&self, _convo_id: &str) -> Vec<Message> {
-            Self::empty_vec("messages")
+            Vec::new()
+        }
+        fn open_timeline(&self, convo_id: &str) {
+            let _ = self.tx.send(Command::OpenTimeline {
+                room_id: convo_id.to_string(),
+            });
+        }
+        fn close_timeline(&self, convo_id: &str) {
+            let _ = self.tx.send(Command::CloseTimeline {
+                room_id: convo_id.to_string(),
+            });
+        }
+        async fn load_older(&self, convo_id: &str) -> Result<usize, ClientError> {
+            self.ask(move |reply| Command::LoadOlder {
+                room_id: convo_id.to_string(),
+                reply,
+            })
+            .await
         }
         async fn thread(&self, _message_id: &str) -> Vec<ThreadReply> {
             Self::empty_vec("thread")
