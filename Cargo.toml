@@ -16,4 +16,4 @@ matrix-sdk-ui = "0.18"
 
 # workspace
 ui = { path = "packages/ui" }
-client = { path = "packages/client" }
+client = { path = "packages/client", default-features = false }

@@ -3,7 +3,7 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use crate::chat::VerifyDialog;
-use crate::data::{Device, VesperClient};
+use crate::data::{Device, Me, VesperClient};
 use crate::design_system::{
     Avatar, Button, ButtonSize, ButtonVariant, SelectOption, SidebarNav, SidebarNavItem, Switch,
 };
@@ -89,6 +89,9 @@ pub fn SettingsScreen(
         })
         .unwrap_or_default();
 
+    // Clone for the logout handler without moving `client` (still used below).
+    let logout_client = client.clone();
+
     rsx! {
         div { style: "flex:1;display:flex;min-width:0;flex-direction:column;height:100%;",
             div {
@@ -153,7 +156,20 @@ pub fn SettingsScreen(
                                 ],
                             }
                             div {
-                                Button { variant: ButtonVariant::Danger, size: ButtonSize::Sm,
+                                Button {
+                                    variant: ButtonVariant::Danger,
+                                    size: ButtonSize::Sm,
+                                    onclick: move |_| {
+                                        let client = logout_client.clone();
+                                        spawn(async move {
+                                            if let Err(e) = client.logout().await {
+                                                tracing::warn!("logout failed: {e}");
+                                            }
+                                            // Clearing the identity signal drops the router
+                                            // back to LoginScreen regardless of backend.
+                                            use_context::<Signal<Option<Me>>>().set(None);
+                                        });
+                                    },
                                     Icon { name: IconName::LogOut, size: 14 }
                                     " Sign out"
                                 }

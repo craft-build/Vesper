@@ -1,7 +1,9 @@
 //! Domain types shared by every `VesperClient` implementation.
 //!
 //! These are plain data — no Matrix-specific or mock-specific concepts leak in here,
-//! so a real `matrix-sdk`-backed client can produce the exact same shapes.
+//! so both the mock backend and the `matrix-sdk`-backed client produce the exact
+//! same shapes. (Moved here from `ui::data::model` in checkpoint 02 so that the
+//! `client` crate can implement the trait without depending on the UI.)
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Me {

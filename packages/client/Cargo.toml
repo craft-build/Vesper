@@ -3,14 +3,32 @@ name = "client"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Everything that links matrix-sdk. Native builds use this; wasm (`web`)
+# consumes this crate with default features off and gets only the trait seam.
+default = ["matrix"]
+matrix = [
+    "dep:matrix-sdk",
+    "dep:matrix-sdk-ui",
+    "dep:tokio",
+    "dep:anyhow",
+    "dep:tracing",
+    "dep:directories",
+    "dep:serde",
+    "dep:serde_json",
+]
+
 [dependencies]
-matrix-sdk = { workspace = true }
-matrix-sdk-ui = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
 async-trait = "0.1"
-anyhow = "1"
-tracing = "0.1"
-futures = "0.3"
-directories = "6"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+matrix-sdk = { workspace = true, optional = true }
+matrix-sdk-ui = { workspace = true, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"], optional = true }
+anyhow = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
+directories = { version = "6", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tempfile = "3"

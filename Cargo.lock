@@ -764,11 +764,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "directories",
- "futures",
  "matrix-sdk",
  "matrix-sdk-ui",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -7508,8 +7508,10 @@ name = "ui"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "client",
  "dioxus",
  "regex",
+ "tracing",
 ]
 
 [[package]]

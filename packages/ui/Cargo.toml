@@ -12,3 +12,11 @@ desktop = ["dioxus/desktop"]
 dioxus = { workspace = true, features = ["router"] }
 async-trait = "0.1"
 regex = "1"
+tracing = "0.1"
+# Trait seam + domain types live here; wasm gets this with default features
+# off (no matrix-sdk), native additionally gets the real MatrixClient below.
+client = { workspace = true, default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native-only: enables the `matrix` feature (matrix-sdk + runtime bridge).
+client = { workspace = true, features = ["matrix"] }

@@ -1,14 +1,12 @@
 //! In-memory client seeded with the same dataset as the prototype's `data.js`.
 //!
-//! This is the piece meant to be thrown away: a future `MatrixClient` implements the
-//! same [`VesperClient`] trait against a real homeserver, and gets swapped in at the
-//! single `use_context_provider` call in `crate::app`.
+//! The real backend lives in the `client` crate (`MatrixClient`); which one the app
+//! uses is chosen in [`crate::data::backend`].
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use super::client::{ClientError, VesperClient};
-use super::model::*;
+use crate::data::*;
 
 struct MockState {
     me: Me,
@@ -468,8 +466,22 @@ impl Default for MockClient {
 
 #[async_trait::async_trait(?Send)]
 impl VesperClient for MockClient {
-    async fn login(&self, _user_id: String, _password: String) -> Result<Me, ClientError> {
+    async fn login(
+        &self,
+        _homeserver: String,
+        _user_id: String,
+        _password: String,
+    ) -> Result<Me, ClientError> {
         Ok(self.state.borrow().me.clone())
+    }
+
+    async fn restore(&self) -> Result<Option<Me>, ClientError> {
+        // The mock keeps today's UX: every launch starts at the login screen.
+        Ok(None)
+    }
+
+    async fn logout(&self) -> Result<(), ClientError> {
+        Ok(())
     }
 
     async fn me(&self) -> Option<Me> {

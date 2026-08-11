@@ -11,6 +11,8 @@ use super::thread_panel::ThreadPanel;
 use super::{CallScreen, CallState, ChatUiState, ProfileTarget, SidePanel};
 use crate::app::Route;
 use crate::data::{ConvoKind, VesperClient};
+use crate::icons::Icon;
+use crate::window_chrome::{DragStrip, WindowControls};
 
 #[component]
 pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
@@ -161,6 +163,21 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                         on_open_room_info: open_room_info.clone(),
                     }
                 } else {
+                    // Window controls normally live in FocusHeader, which is only
+                    // rendered when a convo is selected. The empty state (real
+                    // backend before checkpoint 03 loads rooms) needs its own
+                    // minimal chrome bar — otherwise there's no way to close the
+                    // borderless window or open the drawer to reach settings.
+                    div { style: "height:56px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;padding:0 14px;gap:6px;flex-shrink:0;",
+                        button {
+                            title: "Rooms",
+                            onclick: move |_| ui.nav_open.set(!(ui.nav_open)()),
+                            style: "background:none;border:none;color:var(--text-secondary);cursor:pointer;display:flex;padding:8px;border-radius:var(--radius-md);",
+                            Icon { name: crate::icons::IconName::Layers, size: 18 }
+                        }
+                        DragStrip {}
+                        WindowControls {}
+                    }
                     div { style: "flex:1;display:flex;align-items:center;justify-content:center;color:var(--text-tertiary);font-size:14px;text-align:center;padding:24px;",
                         "Select a room or direct message to start chatting."
                     }

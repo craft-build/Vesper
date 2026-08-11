@@ -2,38 +2,67 @@
 //!
 //! matrix-sdk is async and needs a tokio runtime; the UI is not. `ClientRuntime`
 //! owns a tokio runtime on a dedicated background thread and accepts commands
-//! over an [`UnboundedSender`]. Each command carries a oneshot/callback so the
-//! caller can await the result from wherever it lives.
+//! over an [`UnboundedSender`]. Each command carries a oneshot so the caller
+//! can await the result from wherever it lives.
 //!
-//! Checkpoint 02 starts filling in real commands (`Login`, `SendMessage`, ...);
-//! for now only `Ping` exists to prove the round trip works.
+//! Thread ownership: the `matrix_sdk::Client` is constructed inside this task
+//! in response to `Login`/`Restore` and is owned here forever. Nothing
+//! non-`Send` ever crosses the bridge — the channel payloads are plain data by
+//! construction (see docs/00-roadmap.md §3).
+//!
+//! Checkpoint 02 commands: `Login`, `Restore`, `Logout` (auth + session
+//! persistence) and `Ping` for the round-trip sanity check.
 
 use anyhow::Result;
+use matrix_sdk::Client;
 use tokio::{
     runtime::Runtime,
     sync::{mpsc::UnboundedSender, oneshot},
 };
 
+use crate::{api::ClientError, model::Me, session};
+
 /// Commands the UI can send into the Matrix runtime.
+///
+/// Every variant answers through its oneshot; never `unwrap`/panic between
+/// receiving a command and answering it, or the Dioxus side hangs waiting on
+/// a dropped sender.
 pub enum Command {
     /// Connectivity sanity check. Responds with the echoed payload.
     Ping {
         payload: String,
         reply: oneshot::Sender<String>,
     },
+    /// Password login against `homeserver` (e.g. `matrix.org`; well-known
+    /// discovery resolves the client API URL). On success the session is
+    /// persisted to disk and `reply` carries the identity snapshot.
+    Login {
+        homeserver: String,
+        user_id: String,
+        password: String,
+        reply: oneshot::Sender<Result<Me, ClientError>>,
+    },
+    /// Attempt to restore the persisted session. `Ok(None)` means "no stored
+    /// session" — the normal first-run state.
+    Restore {
+        reply: oneshot::Sender<Result<Option<Me>, ClientError>>,
+    },
+    /// End the current session (remote + local cleanup).
+    Logout {
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    /// The cached identity snapshot, if a session is active.
+    WhoAmI { reply: oneshot::Sender<Option<Me>> },
 }
 
-/// Owns the tokio runtime that matrix-sdk code will run on.
-///
-/// Dropping this shuts the runtime down; send on the returned sender before
-/// dropping if you need a reply.
+/// Owns the tokio runtime that matrix-sdk code runs on.
 pub struct ClientRuntime {
     handle: std::thread::JoinHandle<()>,
 }
 
 impl ClientRuntime {
-    /// Spawn a dedicated thread hosting a multi-threaded tokio runtime that
-    /// processes [`Command`]s. Returns the runtime owner and the command sender.
+    /// Spawn the dedicated thread hosting the tokio runtime. Returns the
+    /// runtime owner and the command sender.
     pub fn spawn() -> (Self, UnboundedSender<Command>) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
         let handle = std::thread::Builder::new()
@@ -41,11 +70,59 @@ impl ClientRuntime {
             .spawn(move || {
                 let runtime = Runtime::new().expect("failed to build tokio runtime");
                 runtime.block_on(async move {
+                    // The SDK client lives and dies inside this task.
+                    let mut sdk_client: Option<Client> = None;
+                    let mut me: Option<Me> = None;
+
                     while let Some(cmd) = rx.recv().await {
                         match cmd {
                             Command::Ping { payload, reply } => {
                                 tracing::debug!(payload = %payload, "ping");
                                 let _ = reply.send(format!("pong:{payload}"));
+                            }
+                            Command::Login {
+                                homeserver,
+                                user_id,
+                                password,
+                                reply,
+                            } => {
+                                tracing::info!(%user_id, "login attempt");
+                                let result =
+                                    session::connect_login(homeserver, user_id, password).await;
+                                match result {
+                                    Ok((client, snapshot)) => {
+                                        sdk_client = Some(client);
+                                        me = Some(snapshot.clone());
+                                        let _ = reply.send(Ok(snapshot));
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(Err(e));
+                                    }
+                                }
+                            }
+                            Command::Restore { reply } => match session::connect_restore().await {
+                                Ok(Some((client, snapshot))) => {
+                                    sdk_client = Some(client);
+                                    me = Some(snapshot.clone());
+                                    let _ = reply.send(Ok(Some(snapshot)));
+                                }
+                                Ok(None) => {
+                                    let _ = reply.send(Ok(None));
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(e));
+                                }
+                            },
+                            Command::Logout { reply } => {
+                                // Take the client (by value) so the session
+                                // module can drop it — closing sqlite handles —
+                                // before deleting the store dir.
+                                let result = session::logout(sdk_client.take()).await;
+                                me = None;
+                                let _ = reply.send(result);
+                            }
+                            Command::WhoAmI { reply } => {
+                                let _ = reply.send(me.clone());
                             }
                         }
                     }
@@ -78,6 +155,47 @@ mod tests {
         .expect("send ping");
         let pong = reply_rx.await.expect("receive pong");
         assert_eq!(pong, "pong:hello");
+        drop(tx);
+        runtime.join().expect("runtime thread exits cleanly");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn whoami_is_none_before_login() {
+        let (runtime, tx) = ClientRuntime::spawn();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(Command::WhoAmI { reply: reply_tx })
+            .expect("send whoami");
+        assert_eq!(reply_rx.await.expect("whoami reply"), None);
+        drop(tx);
+        runtime.join().expect("runtime thread exits cleanly");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn login_with_garbage_homeserver_fails_safely() {
+        // No network dependency: an invalid server name fails client build with
+        // ClientBuildError::InvalidServerName before any request is attempted.
+        // Keep everything out of the real profile directory.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("VESPER_DATA_DIR", tmp.path());
+
+        let (runtime, tx) = ClientRuntime::spawn();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(Command::Login {
+            homeserver: "not a server name at all!!!".into(),
+            user_id: "@x:y".into(),
+            password: "pw".into(),
+            reply: reply_tx,
+        })
+        .expect("send login");
+        let err = reply_rx
+            .await
+            .expect("login reply")
+            .expect_err("login must fail");
+        assert!(
+            err.0.contains("homeserver") || err.0.contains("client"),
+            "unexpected error text: {}",
+            err.0
+        );
         drop(tx);
         runtime.join().expect("runtime thread exits cleanly");
     }
