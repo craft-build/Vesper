@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 dioxus = { workspace = true, features = ["router", "desktop"] }
 ui = { workspace = true, features = ["desktop"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

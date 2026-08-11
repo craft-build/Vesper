@@ -2,15 +2,18 @@
 resolver = "2"
 members = [
     "packages/ui",
+    "packages/client",
     "packages/web",
     "packages/desktop",
     "packages/mobile",
-    "packages/api",
 ]
 
 [workspace.dependencies]
 dioxus = { version = "0.7.1" }
+# matrix-sdk 0.18.x is the current stable — re-check for newer releases.
+matrix-sdk = { version = "0.18", features = ["bundled-sqlite", "markdown"] }
+matrix-sdk-ui = "0.18"
 
 # workspace
 ui = { path = "packages/ui" }
-api = { path = "packages/api" }
+client = { path = "packages/client" }

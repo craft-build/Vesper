@@ -1,6 +1,16 @@
 use dioxus::desktop::{Config, WindowBuilder};
+use tracing_subscriber::EnvFilter;
 
 fn main() {
+    // Structured logging: `RUST_LOG=info,ui=debug dx serve --platform desktop`
+    // to bump verbosity; matrix-sdk is noisy at info so it stays at warn.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,matrix_sdk=warn,ui=debug")),
+        )
+        .init();
+
     // Fully borderless on every platform: the app draws its own window controls
     // (see `window_chrome` in the ui crate) — a single `_ / ▢ / ×` cluster at
     // the top-right of every screen.

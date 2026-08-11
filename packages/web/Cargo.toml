@@ -4,10 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-dioxus = { workspace = true, features = ["router", "fullstack"] }
+dioxus = { workspace = true, features = ["router"] }
 ui = { workspace = true }
 
 [features]
-default = []
+default = ["web"]
 web = ["dioxus/web"]
-server = ["dioxus/server"]
