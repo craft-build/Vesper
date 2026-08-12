@@ -37,13 +37,16 @@ pub fn App() -> Element {
     // publishes into them (idempotent — re-run bodies re-bind harmlessly).
     let convos = use_signal_sync(Vec::<Convo>::new);
     let connecting = use_signal_sync(|| false);
-    // Per-room timelines (checkpoint 04): one map signal, rooms added lazily
-    // as they are opened — see `ClientState::messages`.
+    // Per-room timelines (checkpoint 04) and live thread panels
+    // (checkpoint 05): one map signal each, entries added lazily on open.
     let messages = use_signal_sync(std::collections::BTreeMap::<String, Vec<data::Message>>::new);
+    let threads =
+        use_signal_sync(std::collections::BTreeMap::<String, Vec<data::ThreadReply>>::new);
     let sync_state = ClientState {
         convos,
         connecting,
         messages,
+        threads,
     };
     use_context_provider(|| sync_state);
     use_effect({

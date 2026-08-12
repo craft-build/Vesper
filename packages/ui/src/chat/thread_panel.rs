@@ -3,36 +3,66 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use super::composer::Composer;
-use crate::data::{Message, ThreadReply, VesperClient};
+use crate::data::{ClientState, Message, ThreadReply, VesperClient};
 use crate::design_system::Avatar;
 use crate::icons::{Icon, IconName};
 
 #[component]
 pub fn ThreadPanel(
     root_message: Option<Message>,
+    /// Event id of the thread root — keys the live threads map.
+    root_id: String,
     thread: Vec<ThreadReply>,
+    /// The room containing the thread — needed to build the `m.thread`
+    /// relation when sending (checkpoint 05).
+    convo_id: String,
     on_close: EventHandler<()>,
 ) -> Element {
     let client = use_context::<Rc<dyn VesperClient>>();
-    let mut replies = use_signal(|| thread.clone());
-    let root_id = root_message.as_ref().map(|m| m.id.clone());
+    let sync = use_context::<ClientState>();
+    // Mock-only optimistic rows; the live backend's echo arrives through the
+    // thread-diff stream below.
+    let mut optimistic = use_signal(Vec::<ThreadReply>::new);
+
+    // Live thread: refcounted open/close pairs the panel's mount with the
+    // thread-focused timeline's lifetime. The mock ignores both calls.
+    use_effect({
+        let client = client.clone();
+        let convo_id = convo_id.clone();
+        let root_id = root_id.clone();
+        move || client.open_thread(&convo_id, &root_id)
+    });
+    use_drop({
+        let client = client.clone();
+        let root_id = root_id.clone();
+        move || client.close_thread(&root_id)
+    });
+
+    let live = sync.threads.read().get(&root_id).cloned();
+    let replies = live.unwrap_or_else(|| {
+        let mut base = thread.clone();
+        base.extend(optimistic());
+        base
+    });
 
     let send = move |(text, _attachment): (String, Option<crate::data::Attachment>)| {
         if text.is_empty() {
             return;
         }
-        replies.write().push(ThreadReply {
-            from: "You".into(),
-            mine: true,
-            time: "now".into(),
-            text: text.clone(),
-        });
-        if let Some(id) = root_id.clone() {
-            let client = client.clone();
-            spawn(async move {
-                client.send_thread_reply(&id, text).await;
+        if !sync.threads.read().contains_key(&root_id) {
+            optimistic.write().push(ThreadReply {
+                from: "You".into(),
+                mine: true,
+                time: "now".into(),
+                text: text.clone(),
             });
         }
+        let client = client.clone();
+        let convo_id = convo_id.clone();
+        let root_id = root_id.clone();
+        spawn(async move {
+            client.send_thread_reply(&convo_id, &root_id, text).await;
+        });
     };
 
     rsx! {
@@ -59,8 +89,8 @@ pub fn ThreadPanel(
                         }
                     }
                 }
-                div { style: "font-size:11px;color:var(--text-tertiary);text-align:center;letter-spacing:0.04em;", "{replies().len()} REPLIES" }
-                for r in replies().iter() {
+                div { style: "font-size:11px;color:var(--text-tertiary);text-align:center;letter-spacing:0.04em;", "{replies.len()} REPLIES" }
+                for r in replies.iter() {
                     {
                         let dir = if r.mine { "row-reverse" } else { "row" };
                         let align = if r.mine { "right" } else { "left" };

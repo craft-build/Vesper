@@ -36,10 +36,22 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
         .cloned()
         .collect();
 
+    // Route-scoped selection: a routed room that isn't in the (still
+    // syncing) list renders the empty state, NOT a fallback room. Mounting a
+    // fallback opens the WRONG timeline; when the real room then resolves,
+    // the keyed re-mount disposes the first timeline — losing its
+    // back-paginated history (the "send erases pagination" bug: a send bumps
+    // the room-list entry and can trigger exactly that re-mount).
     let convo = room_id
         .as_ref()
         .and_then(|id| all_convos.iter().find(|c| &c.id == id))
-        .or_else(|| all_convos.iter().find(|c| c.kind == ConvoKind::Room))
+        .or_else(|| {
+            if room_id.is_none() {
+                all_convos.iter().find(|c| c.kind == ConvoKind::Room)
+            } else {
+                None
+            }
+        })
         .cloned();
 
     let select_convo = move |id: String| {
@@ -60,10 +72,30 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
             let mut ui = ui;
             spawn(async move {
                 let Some(room_id) = room_id else { return };
-                let msgs = client.messages(&room_id).await;
-                let root = msgs.into_iter().find(|m| m.id == message_id);
-                let thread = client.thread(&message_id).await;
-                ui.side_panel.set(Some(SidePanel::Thread { root, thread }));
+                // Live backend history lives in the sync map —
+                // `client.messages()` is only populated by the mock. A
+                // missing root meant `ThreadPanel` skipped the actual send
+                // (optimistic row painted, nothing delivered, no thread).
+                let root = sync
+                    .messages
+                    .read()
+                    .get(&room_id)
+                    .and_then(|list| list.iter().find(|m| m.id == message_id))
+                    .cloned();
+                let root = match root {
+                    Some(root) => Some(root),
+                    None => client
+                        .messages(&room_id)
+                        .await
+                        .into_iter()
+                        .find(|m| m.id == message_id),
+                };
+                let thread = client.thread(&room_id, &message_id).await;
+                ui.side_panel.set(Some(SidePanel::Thread {
+                    root,
+                    root_id: message_id,
+                    thread,
+                }));
             });
         }
     };
@@ -183,8 +215,14 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                 div {
                     style: "width:{panel_width};flex-shrink:0;height:100%;position:{panel_position};inset:{panel_inset};z-index:{panel_z_index};",
                     match panel {
-                        SidePanel::Thread { root, thread } => rsx! {
-                            ThreadPanel { root_message: root, thread, on_close: move |_| ui.side_panel.set(None) }
+                        SidePanel::Thread { root, root_id, thread } => rsx! {
+                            ThreadPanel {
+                                root_message: root,
+                                root_id,
+                                thread,
+                                convo_id: convo.as_ref().map(|c| c.id.clone()).unwrap_or_default(),
+                                on_close: move |_| ui.side_panel.set(None),
+                            }
                         },
                         SidePanel::Profile { target } => rsx! {
                             ProfilePanel {

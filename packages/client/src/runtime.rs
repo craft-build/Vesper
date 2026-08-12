@@ -27,7 +27,7 @@ use tokio::{
 
 use crate::{
     api::{ClientError, ClientState},
-    model::{Convo, Me},
+    model::{Convo, Me, Reaction, ThreadReply},
     session, sync,
     timeline::TimelineRegistry,
 };
@@ -83,6 +83,78 @@ pub enum Command {
         room_id: String,
         reply: oneshot::Sender<Result<usize, ClientError>>,
     },
+    /// Send a markdown text message into `room_id`'s open timeline,
+    /// optionally as an in-reply-to on `reply_to` (checkpoint 05).
+    SendMessage {
+        room_id: String,
+        text: String,
+        reply_to: Option<String>,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    /// Send a markdown text message as an `m.thread` reply rooted at
+    /// `root_id` in `room_id` (checkpoint 05).
+    SendThreadReply {
+        room_id: String,
+        root_id: String,
+        text: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    /// Toggle the user's `emoji` reaction on `event_id` in `room_id`:
+    /// sends an annotation or redacts their matching reaction (checkpoint 05).
+    ToggleReaction {
+        room_id: String,
+        event_id: String,
+        emoji: String,
+        reply: oneshot::Sender<Result<Vec<Reaction>, ClientError>>,
+    },
+    /// Retry a wedged/queued local echo (checkpoint 05).
+    RetrySend {
+        room_id: String,
+        message_id: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    /// Abort and remove a pending local echo (checkpoint 05).
+    DiscardSend {
+        room_id: String,
+        message_id: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    /// One-shot read of the thread rooted at `root_id` in `room_id`
+    /// (thread panel, checkpoint 05).
+    FetchThread {
+        room_id: String,
+        root_id: String,
+        reply: oneshot::Sender<Result<Vec<ThreadReply>, ClientError>>,
+    },
+    /// Open (refcounted) the live thread rooted at `root_id` in `room_id` —
+    /// the thread panel keeps it open for live replies. Fire-and-forget.
+    OpenThread { room_id: String, root_id: String },
+    /// Release one reference to `root_id`'s thread.
+    CloseThread { root_id: String },
+}
+
+/// Post-login send-queue setup (checkpoint 05): make sure the global send
+/// queue is enabled (it persists per room, so an earlier recoverable send
+/// failure may have disabled it) and forward queue errors to the log at
+/// `debug`, per docs/05 step 1.
+async fn wire_send_queue(client: &Client) {
+    client.send_queue().set_enabled(true).await;
+    tracing::debug!(
+        enabled = client.send_queue().is_enabled(),
+        "send queue status"
+    );
+    let mut errors = client.send_queue().subscribe_errors();
+    tokio::spawn(async move {
+        loop {
+            match errors.recv().await {
+                Ok(err) => tracing::debug!(?err, "send queue error"),
+                // Lagged behind the broadcast: missing a transient error is
+                // fine, the message state still reflects it.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 /// (Re)start the room-list sync once both halves exist: an authenticated
@@ -158,6 +230,8 @@ impl ClientRuntime {
                                         // caller's await shouldn't wait on it.
                                         sdk_client = Some(client);
                                         me = Some(snapshot.clone());
+                                        wire_send_queue(sdk_client.as_ref().expect("just set"))
+                                            .await;
                                         let _ = reply.send(Ok(snapshot));
                                         restart_sync(&sdk_client, &bound, &mut sync).await;
                                     }
@@ -170,6 +244,7 @@ impl ClientRuntime {
                                 Ok(Some((client, snapshot))) => {
                                     sdk_client = Some(client);
                                     me = Some(snapshot.clone());
+                                    wire_send_queue(sdk_client.as_ref().expect("just set")).await;
                                     let _ = reply.send(Ok(Some(snapshot)));
                                     restart_sync(&sdk_client, &bound, &mut sync).await;
                                 }
@@ -201,6 +276,7 @@ impl ClientRuntime {
                                 if let Some((state, _)) = &bound {
                                     let mut state = *state;
                                     state.messages.set(Default::default());
+                                    state.threads.set(Default::default());
                                 }
                                 // Take the client (by value) so the session
                                 // module can drop it — closing sqlite handles —
@@ -226,6 +302,67 @@ impl ClientRuntime {
                             }
                             Command::LoadOlder { room_id, reply } => {
                                 let _ = reply.send(timelines.load_older(&room_id).await);
+                            }
+                            Command::SendMessage {
+                                room_id,
+                                text,
+                                reply_to,
+                                reply,
+                            } => {
+                                let _ = reply
+                                    .send(timelines.send_message(&room_id, text, reply_to).await);
+                            }
+                            Command::SendThreadReply {
+                                room_id,
+                                root_id,
+                                text,
+                                reply,
+                            } => {
+                                let _ = reply.send(
+                                    timelines.send_thread_reply(&room_id, &root_id, text).await,
+                                );
+                            }
+                            Command::ToggleReaction {
+                                room_id,
+                                event_id,
+                                emoji,
+                                reply,
+                            } => {
+                                let _ = reply.send(
+                                    timelines.toggle_reaction(&room_id, &event_id, &emoji).await,
+                                );
+                            }
+                            Command::RetrySend {
+                                room_id,
+                                message_id,
+                                reply,
+                            } => {
+                                let _ =
+                                    reply.send(timelines.retry_send(&room_id, &message_id).await);
+                            }
+                            Command::DiscardSend {
+                                room_id,
+                                message_id,
+                                reply,
+                            } => {
+                                let _ =
+                                    reply.send(timelines.discard_send(&room_id, &message_id).await);
+                            }
+                            Command::FetchThread {
+                                room_id,
+                                root_id,
+                                reply,
+                            } => {
+                                let _ =
+                                    reply.send(timelines.thread_replies(&room_id, &root_id).await);
+                            }
+                            Command::OpenThread { room_id, root_id } => {
+                                if let Some((state, _)) = &bound {
+                                    timelines.open_thread(&room_id, &root_id, *state).await;
+                                }
+                            }
+                            Command::CloseThread { root_id } => {
+                                timelines.close_thread(&root_id);
                             }
                         }
                     }

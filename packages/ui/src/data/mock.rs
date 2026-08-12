@@ -523,7 +523,7 @@ impl VesperClient for MockClient {
         Ok(0)
     }
 
-    async fn thread(&self, message_id: &str) -> Vec<ThreadReply> {
+    async fn thread(&self, _convo_id: &str, message_id: &str) -> Vec<ThreadReply> {
         self.state
             .borrow()
             .threads
@@ -531,6 +531,11 @@ impl VesperClient for MockClient {
             .cloned()
             .unwrap_or_default()
     }
+
+    // Mock has no live threads: the snapshot `thread()` data plus the
+    // panel's local optimistic pushes stay authoritative.
+    fn open_thread(&self, _convo_id: &str, _message_id: &str) {}
+    fn close_thread(&self, _message_id: &str) {}
 
     async fn send_message(
         &self,
@@ -555,6 +560,7 @@ impl VesperClient for MockClient {
             thread_count: 0,
             attachment,
             read_by: Vec::new(),
+            send_state: SendState::Sent,
         };
         state
             .messages
@@ -564,7 +570,12 @@ impl VesperClient for MockClient {
         message
     }
 
-    async fn send_thread_reply(&self, message_id: &str, text: String) -> ThreadReply {
+    async fn send_thread_reply(
+        &self,
+        _convo_id: &str,
+        message_id: &str,
+        text: String,
+    ) -> ThreadReply {
         let mut state = self.state.borrow_mut();
         let from = state.me.name.clone();
         let reply = ThreadReply {
@@ -616,6 +627,14 @@ impl VesperClient for MockClient {
             }),
         }
         message.reactions.clone()
+    }
+
+    async fn retry_send(&self, _convo_id: &str, _message_id: &str) -> Result<(), ClientError> {
+        Ok(())
+    }
+
+    async fn discard_send(&self, _convo_id: &str, _message_id: &str) -> Result<(), ClientError> {
+        Ok(())
     }
 
     async fn devices(&self) -> Vec<Device> {

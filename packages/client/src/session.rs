@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use matrix_sdk::{
-    Client, ClientBuildError, HttpError, authentication::matrix::MatrixSession,
+    Client, ClientBuildError, HttpError, ThreadingSupport, authentication::matrix::MatrixSession,
     ruma::api::error::ErrorKind,
 };
 
@@ -115,6 +115,15 @@ async fn build_client(homeserver: &str) -> Result<Client, ClientError> {
         .server_name_or_homeserver_url(homeserver)
         .sqlite_store(&store_dir, None)
         .handle_refresh_tokens()
+        // Enable thread support so the event cache tracks thread roots and
+        // populates `MsgLikeContent::thread_summary` (num_replies) on them as
+        // replies land via sync — the "N replies" badge on thread roots is
+        // mapped from this in `timeline::map_msglike`. `with_subscriptions`
+        // is false: we want summary computation, not MSC4306/4308 sliding-sync
+        // thread-subscription filtering.
+        .with_threading_support(ThreadingSupport::Enabled {
+            with_subscriptions: false,
+        })
         .build()
         .await
         .map_err(|e| map_build_error(&e))

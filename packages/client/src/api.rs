@@ -37,6 +37,12 @@ pub struct ClientState {
     /// above. Reading from a component subscribes it to the whole map; the
     /// timeline tasks replace the entry value on every diff batch.
     pub messages: Signal<BTreeMap<String, Vec<Message>>, SyncStorage>,
+    /// Live thread reply lists published by thread-focused timelines
+    /// opened for the thread panel, keyed by the thread root's event id
+    /// (checkpoint 05 follow-up: live thread panel). Same "one map signal""
+    /// lifecycle as `messages`. Snap-shot-only backends (mock) never
+    /// publish here; callers fall back to one-shot data.
+    pub threads: Signal<BTreeMap<String, Vec<ThreadReply>>, SyncStorage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,8 +115,23 @@ pub trait VesperClient {
     /// Returns the number of new messages actually added (0 when the start of
     /// the timeline is reached or the timeline isn't open).
     async fn load_older(&self, convo_id: &str) -> Result<usize, ClientError>;
-    async fn thread(&self, message_id: &str) -> Vec<ThreadReply>;
+    /// Fetch the replies of the thread rooted at `message_id` (a mapped row
+    /// id) within `convo_id` — the room id is required on the real backend
+    /// (the mock ignores it). One-shot: use [`Self::open_thread`] for a
+    /// live-updating list.
+    async fn thread(&self, convo_id: &str, message_id: &str) -> Vec<ThreadReply>;
+    /// Open (refcounted) the live thread rooted at `message_id` in
+    /// `convo_id`: publishes reply rows into `ClientState::threads[message_id]`
+    /// on every diff batch. Mock: no-op.
+    fn open_thread(&self, convo_id: &str, message_id: &str);
+    /// Release one reference to `message_id`'s thread; disposes its
+    /// thread-focused timeline at zero. Mock: no-op.
+    fn close_thread(&self, message_id: &str);
 
+    /// Send a text message into `convo_id`, optionally as an in-reply-to on
+    /// `reply_to` (the message row id). The returned `Message` is only a
+    /// bookkeeping stub — the painted row comes from the backend's live
+    /// timeline (or, for the mock, from its own store).
     async fn send_message(
         &self,
         convo_id: &str,
@@ -118,8 +139,27 @@ pub trait VesperClient {
         attachment: Option<Attachment>,
         reply_to: Option<String>,
     ) -> Message;
-    async fn send_thread_reply(&self, message_id: &str, text: String) -> ThreadReply;
+    /// Send a text reply in the thread rooted at `message_id` within
+    /// `convo_id` (the room id is required to build the `m.thread` relation
+    /// with the real backend).
+    async fn send_thread_reply(
+        &self,
+        convo_id: &str,
+        message_id: &str,
+        text: String,
+    ) -> ThreadReply;
+    /// Add the user's `emoji` reaction to `message_id`, or retract it when
+    /// already present (toggle semantics). The returned aggregate may lag
+    /// the toggle by one echo round-trip on the real backend; live rows
+    /// repaint from the timeline diff stream instead.
     async fn react(&self, convo_id: &str, message_id: &str, emoji: &str) -> Vec<Reaction>;
+
+    /// Retry a failed/queued send identified by its message row id
+    /// (no-op `Ok` in the mock).
+    async fn retry_send(&self, convo_id: &str, message_id: &str) -> Result<(), ClientError>;
+    /// Discard a pending/failed send identified by its message row id,
+    /// removing its local echo (no-op `Ok` in the mock).
+    async fn discard_send(&self, convo_id: &str, message_id: &str) -> Result<(), ClientError>;
 
     async fn devices(&self) -> Vec<Device>;
     async fn verify_device(&self, device_id: &str) -> Result<(), ClientError>;

@@ -27,6 +27,9 @@ use crate::data::{Message, ThreadReply};
 pub enum SidePanel {
     Thread {
         root: Option<Message>,
+        /// Event id of the thread's root message — the key for the live
+        /// threads map even when `root` failed to resolve.
+        root_id: String,
         thread: Vec<ThreadReply>,
     },
     Profile {

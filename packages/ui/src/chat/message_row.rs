@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::data::{AttachmentKind, Message};
+use crate::data::{AttachmentKind, Message, SendState};
 use crate::design_system::Avatar;
 use crate::icons::{Icon, IconName};
 use crate::markdown::render_markdown;
@@ -13,6 +13,8 @@ pub fn MessageRow(
     all_messages: Vec<Message>,
     on_react: EventHandler<(String, String)>,
     on_reply: EventHandler<Message>,
+    on_retry_send: EventHandler<String>,
+    on_discard_send: EventHandler<String>,
     on_open_thread: EventHandler<String>,
     on_open_profile: EventHandler<String>,
 ) -> Element {
@@ -71,6 +73,30 @@ pub fn MessageRow(
                 div {
                     style: "margin-top:4px;padding:10px 14px;border-radius:var(--radius-md);font-size:14px;line-height:1.45;background:{bubble_bg};color:{bubble_color};border:{bubble_border};",
                     dangerous_inner_html: "{html}",
+                }
+                // Send-state footer (checkpoint 05). Static style strings
+                // only: these nodes mount/unmount with the state change, so
+                // they are sent to the DOM exactly once (see the Dioxus 0.7
+                // style-patching note, docs repository memory).
+                if m.send_state == SendState::Sending {
+                    div { style: "display:flex;gap:4px;margin-top:3px;flex-direction:{row_dir};font-size:11px;color:var(--text-tertiary);font-family:var(--font-mono);",
+                        "sending\u{2026}"
+                    }
+                }
+                if m.send_state == SendState::Failed {
+                    div { style: "display:flex;gap:10px;margin-top:3px;flex-direction:{row_dir};align-items:center;font-size:11px;color:#e26a5c;font-family:var(--font-mono);",
+                        span { "failed to send" }
+                        button {
+                            onclick: { let id = m.id.clone(); move |_| on_retry_send.call(id.clone()) },
+                            style: "background:none;border:1px solid #e26a5c;border-radius:4px;color:#e26a5c;font-size:11px;padding:1px 8px;cursor:pointer;",
+                            "Retry"
+                        }
+                        button {
+                            onclick: { let id = m.id.clone(); move |_| on_discard_send.call(id.clone()) },
+                            style: "background:none;border:none;color:var(--text-tertiary);font-size:11px;padding:1px 4px;cursor:pointer;text-decoration:underline;",
+                            "Discard"
+                        }
+                    }
                 }
                 if let Some(attachment) = &m.attachment {
                     div { style: "margin-top:6px;display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg-surface-raised);border:1px solid var(--border-subtle);border-radius:var(--radius-md);",

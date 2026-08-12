@@ -161,22 +161,65 @@ mod matrix_impl {
             })
             .await
         }
-        async fn thread(&self, _message_id: &str) -> Vec<ThreadReply> {
-            Self::empty_vec("thread")
+        // One-shot thread read: builds a thread-focused timeline on the
+        // runtime side (cached events + /relations backfill).
+        async fn thread(&self, convo_id: &str, message_id: &str) -> Vec<ThreadReply> {
+            self.ask(move |reply| Command::FetchThread {
+                room_id: convo_id.to_string(),
+                root_id: message_id.to_string(),
+                reply,
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("thread: {}", e.0);
+                Vec::new()
+            })
         }
 
+        // Checkpoint 05: real sends go through the open timeline's send
+        // queue; the painted row is the local echo in the diff stream. The
+        // returned `Message` is a placeholder — callers ignore it and rely
+        // on the live `ClientState::messages` entry instead.
         async fn send_message(
             &self,
             convo_id: &str,
-            _text: String,
+            text: String,
             _attachment: Option<Attachment>,
-            _reply_to: Option<String>,
+            reply_to: Option<String>,
         ) -> Message {
-            tracing::warn!("send_message: not implemented yet (checkpoint 05)");
-            Message::new(format!("local-{}", convo_id), "", "", "")
+            let send_state = self
+                .ask(move |reply| Command::SendMessage {
+                    room_id: convo_id.to_string(),
+                    text,
+                    reply_to,
+                    reply,
+                })
+                .await
+                .map(|_| SendState::Sending)
+                .unwrap_or(SendState::Failed);
+            let mut stub = Message::new(String::new(), "", "", "");
+            stub.mine = true;
+            stub.send_state = send_state;
+            stub
         }
-        async fn send_thread_reply(&self, _message_id: &str, text: String) -> ThreadReply {
-            tracing::warn!("send_thread_reply: not implemented yet (checkpoint 05)");
+        async fn send_thread_reply(
+            &self,
+            convo_id: &str,
+            message_id: &str,
+            text: String,
+        ) -> ThreadReply {
+            let body = text.clone();
+            if let Err(e) = self
+                .ask(move |reply| Command::SendThreadReply {
+                    room_id: convo_id.to_string(),
+                    root_id: message_id.to_string(),
+                    text: body,
+                    reply,
+                })
+                .await
+            {
+                tracing::warn!("send_thread_reply: {}", e.0);
+            }
             ThreadReply {
                 from: String::new(),
                 time: String::new(),
@@ -184,13 +227,51 @@ mod matrix_impl {
                 text,
             }
         }
-        async fn react(&self, _convo_id: &str, _message_id: &str, _emoji: &str) -> Vec<Reaction> {
-            Self::empty_vec("react")
+        async fn react(&self, convo_id: &str, message_id: &str, emoji: &str) -> Vec<Reaction> {
+            self.ask(move |reply| Command::ToggleReaction {
+                room_id: convo_id.to_string(),
+                event_id: message_id.to_string(),
+                emoji: emoji.to_string(),
+                reply,
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("react: {}", e.0);
+                Vec::new()
+            })
+        }
+        async fn retry_send(&self, convo_id: &str, message_id: &str) -> Result<(), ClientError> {
+            self.ask(move |reply| Command::RetrySend {
+                room_id: convo_id.to_string(),
+                message_id: message_id.to_string(),
+                reply,
+            })
+            .await
+        }
+        async fn discard_send(&self, convo_id: &str, message_id: &str) -> Result<(), ClientError> {
+            self.ask(move |reply| Command::DiscardSend {
+                room_id: convo_id.to_string(),
+                message_id: message_id.to_string(),
+                reply,
+            })
+            .await
         }
 
         async fn devices(&self) -> Vec<Device> {
             Self::empty_vec("devices")
         }
+        fn open_thread(&self, convo_id: &str, message_id: &str) {
+            let _ = self.tx.send(Command::OpenThread {
+                room_id: convo_id.to_string(),
+                root_id: message_id.to_string(),
+            });
+        }
+        fn close_thread(&self, message_id: &str) {
+            let _ = self.tx.send(Command::CloseThread {
+                root_id: message_id.to_string(),
+            });
+        }
+
         async fn verify_device(&self, _device_id: &str) -> Result<(), ClientError> {
             Err(Self::unimplemented("verify_device"))
         }

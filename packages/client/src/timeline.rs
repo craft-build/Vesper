@@ -20,16 +20,28 @@ use std::{
 
 use dioxus_signals::{ReadableExt, WritableExt};
 use futures::StreamExt;
-use matrix_sdk::{Client, RoomState, ruma::RoomId};
+use matrix_sdk::{
+    Client, RoomState,
+    ruma::{
+        EventId, OwnedTransactionId, RoomId,
+        events::{
+            relation::Thread,
+            room::message::{
+                Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+            },
+        },
+    },
+    send_queue::SendHandle,
+};
 use matrix_sdk_ui::timeline::{
-    EventTimelineItem, MembershipChange, MsgLikeContent, MsgLikeKind, Timeline, TimelineBuilder,
-    TimelineDetails, TimelineEventItemId, TimelineItem, TimelineItemContent, TimelineItemKind,
-    VirtualTimelineItem,
+    EventSendState, EventTimelineItem, MembershipChange, MsgLikeContent, MsgLikeKind, Timeline,
+    TimelineBuilder, TimelineDetails, TimelineEventItemId, TimelineFocus, TimelineItem,
+    TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
 };
 
 use crate::{
     api::{ClientError, ClientState},
-    model::{Message, Reaction},
+    model::{Message, Reaction, SendState, ThreadReply},
     sync::apply_diffs,
 };
 
@@ -50,13 +62,34 @@ struct Entry {
     inner: Arc<Mutex<EntryState>>,
     task: tokio::task::JoinHandle<()>,
     refcount: usize,
+    /// Our own MXID, captured at open — needed to map reaction aggregates.
+    own_id: String,
+    /// Send handles for local echoes we originated, correlated to their
+    /// timeline echo via the shared `created_at` timestamp (`SendHandle`
+    /// has no transaction-id accessor in 0.18). Retried (`unwedge`) from
+    /// the UI; discard goes through `Timeline::redact` on the echo.
+    /// Pruned in [`publish`] once an echo resolves to Sent.
+    send_handles: Arc<Mutex<Vec<SendHandle>>>,
 }
 
-/// One live timeline per open room (docs/04 §design decisions). Owned by the
-/// runtime command loop; nothing here is `Send`-verbose beyond the SDK types.
+struct ThreadEntry {
+    task: tokio::task::JoinHandle<()>,
+    refcount: usize,
+    /// State for publishing + clearing the threads-map entry on close.
+    state: ClientState,
+}
+
+/// One live timeline per open room + one thread-focused timeline per open
+/// thread panel (docs/04, docs/05). Owned by the runtime command loop.
 #[derive(Default)]
 pub struct TimelineRegistry {
     entries: HashMap<String, Entry>,
+    /// Open threads, keyed by the thread's root event id — globally unique,
+    /// so no room id needed.
+    threads: HashMap<String, ThreadEntry>,
+    /// Last state seen via `open`/`open_thread`, used by one-shot reads
+    /// that want to republish (and by close/clear to prune the threads map).
+    state: Option<ClientState>,
 }
 
 impl TimelineRegistry {
@@ -89,12 +122,22 @@ impl TimelineRegistry {
             tracing::warn!(room_id, "open_timeline for unknown room");
             return;
         };
+        self.state = Some(state);
         if room.state() != RoomState::Joined {
             tracing::info!(room_id, "skipping timeline for non-joined room");
             return;
         }
 
-        let timeline = match TimelineBuilder::new(&room).build().await {
+        // `hide_threaded_events`: thread replies belong in the thread panel
+        // (thread-focused timelines below), not as main-timeline rows — the
+        // root's "N replies" badge carries them.
+        let timeline = match TimelineBuilder::new(&room)
+            .with_focus(TimelineFocus::Live {
+                hide_threaded_events: true,
+            })
+            .build()
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(room_id, "failed to build timeline: {e}");
@@ -141,10 +184,12 @@ impl TimelineRegistry {
             items: final_items.iter().cloned().collect(),
             mapped_len: 0,
         }));
-        publish(&inner, &state, room_id, &own_id);
+        let send_handles: Arc<Mutex<Vec<SendHandle>>> = Default::default();
+        publish(&inner, &send_handles, &state, room_id, &own_id);
 
         let task = {
             let inner = inner.clone();
+            let send_handles = send_handles.clone();
             let room_id = room_id.to_string();
             let own_id = own_id.clone();
             tokio::spawn(async move {
@@ -154,7 +199,7 @@ impl TimelineRegistry {
                         let mut state_ref = lock(&inner);
                         apply_diffs(&mut state_ref.items, diffs);
                     }
-                    publish(&inner, &state, &room_id, &own_id);
+                    publish(&inner, &send_handles, &state, &room_id, &own_id);
                 }
                 tracing::debug!(room_id, "timeline diff stream ended");
             })
@@ -167,9 +212,119 @@ impl TimelineRegistry {
                 inner,
                 task,
                 refcount: 1,
+                own_id,
+                send_handles,
             },
         );
         tracing::info!(room_id, "timeline opened");
+    }
+
+    /// Open (refcounted) a live, thread-focused timeline for the thread
+    /// rooted at `root_id` in `room_id` (docs/05: live thread panel).
+    /// Requires the room's timeline to be open (the panel is only reachable
+    /// from an open conversation). Failures log, never fail the UI.
+    pub async fn open_thread(&mut self, room_id: &str, root_id: &str, state: ClientState) {
+        if let Some(entry) = self.threads.get_mut(root_id) {
+            entry.refcount += 1;
+            return;
+        }
+        let Ok(root) = EventId::parse(root_id).map(|e| e.to_owned()) else {
+            tracing::warn!(root_id, "ignoring open_thread with bad event id");
+            return;
+        };
+        let Some(room) = self
+            .entries
+            .get(room_id)
+            .map(|entry| entry.timeline.room().clone())
+        else {
+            tracing::warn!(room_id, "open_thread without an open room timeline");
+            return;
+        };
+        let timeline = match TimelineBuilder::new(&room)
+            .with_focus(TimelineFocus::Thread {
+                root_event_id: root,
+            })
+            .build()
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(room_id, "thread timeline build failed: {e}");
+                return;
+            }
+        };
+        self.state = Some(state);
+
+        // Backfill, first publish, and diff consumption all run off the
+        // command loop. The runtime processes commands sequentially, so
+        // doing the `/relations` pagination inline would stall sends, reacts,
+        // and pagination in *every* room until the thread finishes loading.
+        // `TimelineBuilder::build` is local (it subscribes to an in-memory
+        // thread cache; the network fetch is `paginate_backwards`), so it can
+        // stay inline. The first publish still happens after the seed pages,
+        // as before — so the UI's snapshot fallback covers the gap; only who
+        // does the waiting changes.
+        let root_id = root_id.to_string();
+        let task = {
+            let root_id = root_id.clone();
+            tokio::spawn(async move {
+                // Seed a couple of pages before the first publish so reopening
+                // a thread isn't a flash of emptiness.
+                for _ in 0..2 {
+                    match timeline.paginate_backwards(PAGE).await {
+                        Ok(true) => break, // beginning of the thread
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(root_id, "thread backfill failed: {e}");
+                            break;
+                        }
+                    }
+                }
+                let (initial, stream) = timeline.subscribe().await;
+                let inner: Arc<Mutex<Vec<Arc<TimelineItem>>>> =
+                    Arc::new(Mutex::new(initial.iter().cloned().collect()));
+                publish_thread(&state, &root_id, &inner);
+
+                let mut stream = Box::pin(stream);
+                while let Some(diffs) = stream.next().await {
+                    {
+                        let mut items = lock(&inner);
+                        apply_diffs(&mut items, diffs);
+                    }
+                    publish_thread(&state, &root_id, &inner);
+                }
+                tracing::debug!(root_id, "thread diff stream ended");
+            })
+        };
+        self.threads.insert(
+            root_id.clone(),
+            ThreadEntry {
+                task,
+                refcount: 1,
+                state,
+            },
+        );
+        tracing::info!(root_id, "thread opened");
+    }
+
+    /// Release one reference to `root_id`'s thread; disposes at zero and
+    /// drops the published replies so a later open starts clean.
+    pub fn close_thread(&mut self, root_id: &str) {
+        let Some(entry) = self.threads.get_mut(root_id) else {
+            return;
+        };
+        entry.refcount = entry.refcount.saturating_sub(1);
+        if entry.refcount > 0 {
+            return;
+        }
+        if let Some(entry) = self.threads.remove(root_id) {
+            entry.task.abort();
+            let mut map = entry.state.threads.peek().clone();
+            map.remove(root_id);
+            let mut threads = entry.state.threads;
+            threads.set(map);
+            tracing::info!(root_id, "thread closed");
+        }
     }
 
     /// Release one reference to `room_id`; disposes task + timeline at zero.
@@ -216,6 +371,243 @@ impl TimelineRegistry {
         for (_, entry) in self.entries.drain() {
             entry.task.abort();
         }
+        for (_, entry) in self.threads.drain() {
+            entry.task.abort();
+        }
+    }
+}
+
+/// Strip the `txn-` prefix the mapped row id gives local echoes, returning
+/// the raw transaction id, or `None` when the row is a remote/sent event.
+fn txn_of(mapped_id: &str) -> Option<String> {
+    mapped_id.strip_prefix("txn-").map(str::to_owned)
+}
+
+impl TimelineRegistry {
+    /// Send a markdown text message into `room_id`'s open timeline, as a
+    /// reply when `reply_to` (a mapped row id) is given (checkpoint 05).
+    /// The local echo paints through the diff stream; failures land as
+    /// `EventSendState::SendingFailed` on that echo.
+    pub async fn send_message(
+        &self,
+        room_id: &str,
+        text: String,
+        reply_to: Option<String>,
+    ) -> Result<(), ClientError> {
+        let Some(entry) = self.entries.get(room_id) else {
+            return Err(ClientError("That conversation is not open.".into()));
+        };
+        let content = RoomMessageEventContentWithoutRelation::text_markdown(text);
+        if let Some(reply_to) = reply_to {
+            let event_id = EventId::parse(&reply_to)
+                .map(|e| e.to_owned())
+                .map_err(|_| ClientError("Could not send the reply.".into()))?;
+            // `send_reply` builds the spec-shaped fallback body and mentions
+            // itself, and does not return the send handle — retries of a
+            // failed reply fall back to "message already sent or unknown".
+            entry
+                .timeline
+                .send_reply(content, event_id)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(room_id, "reply send failed: {e}");
+                    ClientError("Could not send the reply.".into())
+                })?;
+            Ok(())
+        } else {
+            let handle = entry
+                .timeline
+                .send(content.with_relation(None).into())
+                .await
+                .map_err(|e| {
+                    tracing::warn!(room_id, "send failed: {e}");
+                    ClientError("Could not send the message.".into())
+                })?;
+            lock(&entry.send_handles).push(handle);
+            Ok(())
+        }
+    }
+
+    /// Send a markdown text message as a `m.thread` reply rooted at
+    /// `root_id` (checkpoint 05). The reply-to fallback points at the root:
+    /// we don't track thread tails, and a root fallback is spec-legal.
+    pub async fn send_thread_reply(
+        &self,
+        room_id: &str,
+        root_id: &str,
+        text: String,
+    ) -> Result<(), ClientError> {
+        let Some(entry) = self.entries.get(room_id) else {
+            return Err(ClientError("That conversation is not open.".into()));
+        };
+        let root = EventId::parse(root_id)
+            .map(|e| e.to_owned())
+            .map_err(|_| ClientError("Could not send the thread reply.".into()))?;
+        let mut content = RoomMessageEventContent::text_markdown(text);
+        content.relates_to = Some(Relation::Thread(Thread::plain(root.clone(), root)));
+        let handle = entry.timeline.send(content.into()).await.map_err(|e| {
+            tracing::warn!(room_id, "thread reply send failed: {e}");
+            ClientError("Could not send the thread reply.".into())
+        })?;
+        lock(&entry.send_handles).push(handle);
+        Ok(())
+    }
+
+    /// Toggle `emoji` on `event_id` (a mapped row id of a remote/sent event):
+    /// sends an `m.annotation` or redacts the user's matching reaction.
+    /// NOTE: the returned aggregate can still be pre-toggle — the SDK defers
+    /// local reflection to the echo; repainting comes from the diff stream
+    /// and callers so far ignore the return (mock parity only).
+    pub async fn toggle_reaction(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        emoji: &str,
+    ) -> Result<Vec<Reaction>, ClientError> {
+        let Some(entry) = self.entries.get(room_id) else {
+            return Err(ClientError("That conversation is not open.".into()));
+        };
+        let Ok(cid) = EventId::parse(event_id).map(|e| e.to_owned()) else {
+            // Not a real event id (e.g. a `txn-` local echo) — nothing the
+            // timeline can toggle a reaction on.
+            return Err(ClientError("Could not react to that message.".into()));
+        };
+        entry
+            .timeline
+            .toggle_reaction(&TimelineEventItemId::EventId(cid.clone()), emoji)
+            .await
+            .map_err(|e| {
+                tracing::warn!(room_id, "reaction toggle failed: {e}");
+                ClientError("Could not update the reaction.".into())
+            })?;
+        let guard = lock(&entry.inner);
+        for item in &guard.items {
+            let TimelineItemKind::Event(event) = item.kind() else {
+                continue;
+            };
+            if event.event_id() != Some(cid.as_ref()) {
+                continue;
+            }
+            if let TimelineItemContent::MsgLike(msglike) = event.content() {
+                return Ok(aggregate_reactions(msglike, &entry.own_id));
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// One-shot read of the thread rooted at `root_id` (checkpoint 05,
+    /// thread panel): builds a thread-focused timeline against the same
+    /// room — cached thread events plus `/relations` back-pagination —
+    /// maps message rows to `ThreadReply`s, then drops it. Does not touch
+    /// the room's live timeline entry.
+    pub async fn thread_replies(
+        &self,
+        room_id: &str,
+        root_id: &str,
+    ) -> Result<Vec<ThreadReply>, ClientError> {
+        let Some(entry) = self.entries.get(room_id) else {
+            return Err(ClientError("That conversation is not open.".into()));
+        };
+        let root = EventId::parse(root_id)
+            .map(|e| e.to_owned())
+            .map_err(|_| ClientError("Could not open that thread.".into()))?;
+        let timeline = TimelineBuilder::new(entry.timeline.room())
+            .with_focus(TimelineFocus::Thread {
+                root_event_id: root,
+            })
+            .build()
+            .await
+            .map_err(|e| {
+                tracing::warn!(room_id, "thread timeline build failed: {e}");
+                ClientError("Could not open that thread.".into())
+            })?;
+        // Backfill up to two pages of thread replies from the server so
+        // pre-existing threads are actually populated, not just live ones.
+        for _ in 0..2 {
+            match timeline.paginate_backwards(PAGE).await {
+                Ok(true) => break, // beginning of the thread
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(room_id, "thread pagination failed: {e}");
+                    break;
+                }
+            }
+        }
+        let (items, _stream) = timeline.subscribe().await;
+        Ok(items
+            .iter()
+            .filter_map(|item| thread_reply_row(item))
+            .collect())
+    }
+
+    /// Retry a wedged local echo. Correlates the row (mapped `txn-` id) to
+    /// its `SendHandle` via the echo's `local_created_at` timestamp, then
+    /// `unwedge`s it out of the send queue's stuck state.
+    pub async fn retry_send(&self, room_id: &str, mapped_id: &str) -> Result<(), ClientError> {
+        let Some(entry) = self.entries.get(room_id) else {
+            return Err(ClientError("That conversation is not open.".into()));
+        };
+        let Some(txn) = txn_of(mapped_id) else {
+            return Err(ClientError("Only pending messages can be retried.".into()));
+        };
+        let created_at = {
+            let guard = lock(&entry.inner);
+            guard.items.iter().find_map(|item| match item.kind() {
+                TimelineItemKind::Event(event) => {
+                    let matches_txn = matches!(
+                        event.identifier(),
+                        TimelineEventItemId::TransactionId(id) if id.as_str() == txn
+                    );
+                    matches_txn.then(|| event.local_created_at()).flatten()
+                }
+                TimelineItemKind::Virtual(_) => None,
+            })
+        };
+        let Some(created_at) = created_at else {
+            return Err(ClientError("Message already sent or unknown.".into()));
+        };
+        let handle = {
+            let handles = lock(&entry.send_handles);
+            let mut matches = handles.iter().filter(|h| h.created_at == created_at);
+            match (matches.next(), matches.next()) {
+                // Two sends in the same millisecond share `created_at`;
+                // rather than retrying the wrong message, report unknown.
+                (Some(h), None) => Some(h.clone()),
+                _ => None,
+            }
+        };
+        let Some(handle) = handle else {
+            return Err(ClientError("Message already sent or unknown.".into()));
+        };
+        handle.unwedge().await.map_err(|e| {
+            tracing::warn!(room_id, "retry failed: {e}");
+            ClientError("Could not retry the message.".into())
+        })
+    }
+
+    /// Discard a pending local echo: `Timeline::redact` on a local echo
+    /// aborts it in the send queue (verified against matrix-sdk-ui 0.18:
+    /// the `TimelineItemHandle::Local` branch calls `SendHandle::abort`).
+    pub async fn discard_send(&self, room_id: &str, mapped_id: &str) -> Result<(), ClientError> {
+        let Some(entry) = self.entries.get(room_id) else {
+            return Err(ClientError("That conversation is not open.".into()));
+        };
+        let Some(txn) = txn_of(mapped_id) else {
+            return Err(ClientError(
+                "Only pending messages can be discarded.".into(),
+            ));
+        };
+        entry
+            .timeline
+            .redact(
+                &TimelineEventItemId::TransactionId(OwnedTransactionId::from(txn)),
+                None,
+            )
+            .await
+            .map_err(|e| {
+                tracing::warn!(room_id, "discard failed: {e}");
+                ClientError("Could not discard the message.".into())
+            })
     }
 }
 
@@ -226,7 +618,17 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Re-map the whole item list and publish it into `ClientState::messages`.
 /// Remapping per batch is O(n) in the visible window but side-effect free; a
 /// diff-preserving mapper is premature for chat-sized pages.
-fn publish(inner: &Mutex<EntryState>, state: &ClientState, room_id: &str, own_id: &str) {
+///
+/// Also prunes `send_handles` whose echo is no longer pending (Sent or
+/// cancelled): a retry/discard against the mapped id then correctly reports
+/// "already sent".
+fn publish(
+    inner: &Mutex<EntryState>,
+    send_handles: &Mutex<Vec<SendHandle>>,
+    state: &ClientState,
+    room_id: &str,
+    own_id: &str,
+) {
     let mapped: Vec<Message> = {
         let guard = lock(inner);
         guard
@@ -236,10 +638,42 @@ fn publish(inner: &Mutex<EntryState>, state: &ClientState, room_id: &str, own_id
             .collect()
     };
     lock(inner).mapped_len = mapped.len();
+    {
+        let guard = lock(inner);
+        // Keep handles only for echos still present as Local-kind items:
+        // `local_created_at` is Some exactly for those, so an echo that
+        // resolved to a remote item drops its handle.
+        let pending: std::collections::HashSet<_> = guard
+            .items
+            .iter()
+            .filter_map(|item| match item.kind() {
+                TimelineItemKind::Event(event) => event.local_created_at(),
+                TimelineItemKind::Virtual(_) => None,
+            })
+            .collect();
+        lock(send_handles).retain(|h| pending.contains(&h.created_at));
+    }
     let mut map = state.messages.peek().clone();
     map.insert(room_id.to_string(), mapped);
     let mut messages = state.messages;
     messages.set(map);
+}
+
+/// Re-map a thread-focused timeline and publish it into
+/// `ClientState::threads[root_id]`. Same map-replace discipline as
+/// [`publish`].
+fn publish_thread(state: &ClientState, root_id: &str, items: &Mutex<Vec<Arc<TimelineItem>>>) {
+    let replies: Vec<ThreadReply> = {
+        let guard = lock(items);
+        guard
+            .iter()
+            .filter_map(|item| thread_reply_row(item))
+            .collect()
+    };
+    let mut map = state.threads.peek().clone();
+    map.insert(root_id.to_string(), replies);
+    let mut threads = state.threads;
+    threads.set(map);
 }
 
 /// Map one timeline item to a UI message. `None` = nothing to render
@@ -252,11 +686,21 @@ fn map_item(item: &TimelineItem, own_id: &str) -> Option<Message> {
 }
 
 fn map_event(event: &EventTimelineItem, own_id: &str) -> Option<Message> {
-    // Remote events key by event id; local echoes only carry a transaction
-    // id (pending styling is checkpoint 05) but still need a stable row key.
+    // Remote events key by event id; local echoes key by transaction id.
+    // NOTE: the SDK replaces a pending echo with the Sent/remote echo in
+    // place through the diff stream — do NOT hand-merge echoes by content
+    // here (docs/05). The `txn-` prefix lets retry/discard find the send
+    // handle again (and lets the UI ignore reaction toggles on echoes).
     let id = match event.identifier() {
         TimelineEventItemId::EventId(id) => id.to_string(),
         TimelineEventItemId::TransactionId(id) => format!("txn-{id}"),
+    };
+    // 0.18's EventSendState has no separate "sending" variant: every
+    // in-flight echo is `NotSentYet`.
+    let send_state = match event.send_state() {
+        Some(EventSendState::NotSentYet { .. }) => SendState::Sending,
+        Some(EventSendState::SendingFailed { .. }) => SendState::Failed,
+        Some(EventSendState::Sent { .. }) | None => SendState::Sent,
     };
     let from = match event.sender_profile() {
         TimelineDetails::Ready(profile) => profile
@@ -271,6 +715,7 @@ fn map_event(event: &EventTimelineItem, own_id: &str) -> Option<Message> {
         let mut m = Message::new(id.clone(), from.clone(), time.clone(), text);
         m.mine = event.is_own();
         m.system = system;
+        m.send_state = send_state;
         m
     };
 
@@ -351,6 +796,13 @@ fn map_msglike(
     let mut m = msg(text, system);
     m.reactions = reactions;
     m.reply_to = reply_to;
+    // Thread root reply count ("N replies" badge), from the SDK's thread
+    // summary; updates through the same diff batch as the reply lands.
+    m.thread_count = msglike
+        .thread_summary
+        .as_ref()
+        .map(|summary| summary.num_replies)
+        .unwrap_or(0);
     m
 }
 
@@ -369,6 +821,38 @@ fn emote_row(
         .as_ref()
         .map(|details| details.event_id.to_string());
     m
+}
+
+/// Map one thread-timeline item to a panel row. Skips virtual items and
+/// non-message events; redactions/decrypt failures use the same placeholder
+/// texts as the main timeline.
+fn thread_reply_row(item: &TimelineItem) -> Option<ThreadReply> {
+    let TimelineItemKind::Event(event) = item.kind() else {
+        return None;
+    };
+    let TimelineItemContent::MsgLike(msglike) = event.content() else {
+        return None;
+    };
+    let text = match &msglike.kind {
+        MsgLikeKind::Message(message) => message.body().to_string(),
+        MsgLikeKind::Redacted => "message removed".into(),
+        MsgLikeKind::UnableToDecrypt(_) => "\u{1f512} unable to decrypt".into(),
+        MsgLikeKind::Sticker(s) => format!("sticker: {}", s.content().body),
+        _ => return None,
+    };
+    let from = match event.sender_profile() {
+        TimelineDetails::Ready(profile) => profile
+            .display_name
+            .clone()
+            .unwrap_or_else(|| event.sender().to_string()),
+        _ => event.sender().to_string(),
+    };
+    Some(ThreadReply {
+        from,
+        time: format_hhmm(event.timestamp().get().into()),
+        mine: event.is_own(),
+        text,
+    })
 }
 
 fn aggregate_reactions(msglike: &MsgLikeContent, own_id: &str) -> Vec<Reaction> {

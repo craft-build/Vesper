@@ -76,6 +76,21 @@ pub struct Reaction {
     pub me: bool,
 }
 
+/// Delivery state of a message the local user sent (checkpoint 05).
+///
+/// `Sent` is also the state for everything that didn't originate here —
+/// received messages carry no send state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SendState {
+    /// Server-confirmed (or a received remote message): the default.
+    #[default]
+    Sent,
+    /// Local echo in the send queue or in flight.
+    Sending,
+    /// Sending failed; the UI offers retry/discard.
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub id: String,
@@ -89,6 +104,7 @@ pub struct Message {
     pub thread_count: u32,
     pub attachment: Option<Attachment>,
     pub read_by: Vec<String>,
+    pub send_state: SendState,
 }
 
 impl Message {
@@ -110,6 +126,7 @@ impl Message {
             thread_count: 0,
             attachment: None,
             read_by: Vec::new(),
+            send_state: SendState::Sent,
         }
     }
 }
