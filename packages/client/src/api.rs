@@ -43,6 +43,30 @@ pub struct ClientState {
     /// lifecycle as `messages`. Snap-shot-only backends (mock) never
     /// publish here; callers fall back to one-shot data.
     pub threads: Signal<BTreeMap<String, Vec<ThreadReply>>, SyncStorage>,
+    /// Per-room typing indicators (checkpoint 06): resolved display names of
+    /// the users currently typing in each room, keyed by room id. Written by
+    /// the backend's typing task from `m.typing` ephemeral events; read by the
+    /// conversation's typing row. Same one-map lifecycle as `messages` — a
+    /// single map signal created in the App scope, entries upserted/cleared
+    /// by the typing task. Snap-shot-only backends (mock) never publish here.
+    pub typing: Signal<BTreeMap<String, Vec<String>>, SyncStorage>,
+    /// Per-user presence (checkpoint 06): the latest presence for each user
+    /// keyed by MXID, written by the backend's presence task from
+    /// `m.presence` events and read by the profile panel and the nav-drawer
+    /// status dots (via the `Convo.status` mapping done in the sync task).
+    /// Same one-map lifecycle as `messages`.
+    pub presence: Signal<BTreeMap<String, Presence>, SyncStorage>,
+    /// Whether the app window is focused (checkpoint 06): UI-written (the
+    /// shell's focus/visibility listener), backend-read by the desktop
+    /// notification task to suppress notifications while the user is looking
+    /// at the app. The notification task lives behind the `matrix` feature
+    /// and only reads `peek()`, so a plain UI-side signal is safe.
+    pub focused: Signal<bool, SyncStorage>,
+    /// The room id of the currently open conversation (checkpoint 06):
+    /// UI-written (the chat view's mount/drop effect), backend-read by the
+    /// desktop notification task to suppress notifications for the room the
+    /// user is already in. `None` when no room is open.
+    pub active_room: Signal<Option<String>, SyncStorage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +184,19 @@ pub trait VesperClient {
     /// Discard a pending/failed send identified by its message row id,
     /// removing its local echo (no-op `Ok` in the mock).
     async fn discard_send(&self, convo_id: &str, message_id: &str) -> Result<(), ClientError>;
+
+    /// Tell the backend the user is (or is not) typing in `convo_id`
+    /// (checkpoint 06). The composer calls this on input / send. The real
+    /// backend debounces a 4s idle reset and stops on send; the mock no-ops.
+    /// Fire-and-forget: never blocks the composer.
+    fn set_typing(&self, _convo_id: &str, _typing: bool) {}
+
+    /// Mark `convo_id` as read up to its latest event (checkpoint 06): the
+    /// conversation calls this on mount and when new items arrive while it's
+    /// focused. The real backend sends a throttled `m.read` receipt (>=1s
+    /// between sends, only when the latest event advances); the mock no-ops.
+    /// Fire-and-forget.
+    fn mark_read(&self, _convo_id: &str) {}
 
     async fn devices(&self) -> Vec<Device>;
     async fn verify_device(&self, device_id: &str) -> Result<(), ClientError>;

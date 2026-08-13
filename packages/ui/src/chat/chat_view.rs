@@ -152,6 +152,33 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
 
     let active_id = convo.as_ref().map(|c| c.id.clone()).unwrap_or_default();
     let is_mobile = (ui.is_mobile)();
+
+    // The currently-open room (checkpoint 06): published to `sync.active_room`
+    // so the desktop-notification task suppresses notifications for the room
+    // the user is already in. Guarded against same-value writes so an
+    // unrelated re-render never dirties the notification task's read; cleared
+    // on unmount only if it still points at this room.
+    use_effect({
+        let sync = sync;
+        let active_id = active_id.clone();
+        move || {
+            let mut active_room = sync.active_room;
+            if active_room.read().as_deref() != Some(active_id.as_str()) {
+                active_room.set(Some(active_id.clone()));
+            }
+        }
+    });
+    use_drop({
+        let sync = sync;
+        let active_id = active_id.clone();
+        move || {
+            let mut active_room = sync.active_room;
+            if active_room.read().as_deref() == Some(active_id.as_str()) {
+                active_room.set(None);
+            }
+        }
+    });
+
     let panel_width = if is_mobile { "100%" } else { "340px" };
     let panel_position = if is_mobile { "absolute" } else { "static" };
     let panel_inset = if is_mobile { "0" } else { "auto" };

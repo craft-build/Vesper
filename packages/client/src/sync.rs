@@ -16,9 +16,10 @@
 //! accessor in 0.18 and no UI surface yet — deferred (docs/03 §Design
 //! decisions permits this).
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use dioxus_signals::{Signal, SyncStorage, WritableExt};
+use dioxus_signals::{ReadableExt, Signal, SyncStorage, WritableExt};
 use eyeball_im::VectorDiff;
 use futures::StreamExt;
 use matrix_sdk::{Client, RoomState};
@@ -31,7 +32,7 @@ use matrix_sdk_ui::{
 
 use crate::{
     api::{ClientError, ClientState},
-    model::{Convo, ConvoKind},
+    model::{Convo, ConvoKind, Presence},
 };
 
 /// Page size for the room list's dynamic entries controller. Pagination is a
@@ -72,6 +73,12 @@ pub async fn start_room_list(
         .await
         .map_err(|e| ClientError(format!("Could not build the sync service: {e}")))?;
 
+    // Our own MXID, captured once for DM-counterpart resolution (checkpoint
+    // 06): a DM's `Convo.mxid` is the *other* member, and `Convo.status` is
+    // that member's presence from `state.presence`. Captured before
+    // `RoomListService::new` moves `client`.
+    let own_id = client.user_id().map(|u| u.to_owned());
+
     // `RoomListService::new` subscribes the event cache itself (required for
     // unread counts under sliding sync); do not call it again here.
     let room_list_service = RoomListService::new(client)
@@ -88,6 +95,7 @@ pub async fn start_room_list(
     // from this runtime thread are plainly legal (they use SyncStorage).
     let mut convos_signal = state.convos;
     let mut connecting = state.connecting;
+    let presence_signal = state.presence;
     // `connecting` should only flip to false once (the sync state's offline
     // handling takes over from there); avoid redundant signal writes.
     let mut warmed = false;
@@ -131,7 +139,10 @@ pub async fn start_room_list(
                             logged_invites = invite_count;
                         }
                         let mapped: Vec<Convo> = futures::future::join_all(
-                            items.iter().filter(NOT_INVITED).map(map_item),
+                            items
+                                .iter()
+                                .filter(NOT_INVITED)
+                                .map(|i| map_item(i, own_id.as_ref(), presence_signal)),
                         )
                         .await;
                         publish(&mut convos_signal, &snapshot, mapped);
@@ -181,10 +192,40 @@ fn publish(
 
 /// Map one room list item to the UI's `Convo` shape. Mostly cache reads
 /// (they were pre-computed for the filters); `is_direct` is the only async
-/// store lookup, batched via `join_all` by the caller.
-async fn map_item(item: &RoomListItem) -> Convo {
+/// store lookup, batched via `join_all` by the caller. For DMs (checkpoint 06)
+/// we additionally resolve the *other* member's MXID and look up their
+/// presence in `presence_signal` — the nav drawer's status dot and the
+/// profile panel read these.
+async fn map_item(
+    item: &RoomListItem,
+    own_id: Option<&matrix_sdk::ruma::OwnedUserId>,
+    presence_signal: dioxus_signals::Signal<
+        BTreeMap<String, Presence>,
+        dioxus_signals::SyncStorage,
+    >,
+) -> Convo {
+    use matrix_sdk::RoomMemberships;
     let is_dm = item.is_direct().await.unwrap_or(false);
     let counts = item.unread_notification_counts();
+    // DM counterpart: the other joined member. Falls back to `None` when
+    // member state hasn't synced yet — the dot stays Offline until it does.
+    let (mxid, status) = if is_dm {
+        match item.members(RoomMemberships::JOIN).await {
+            Ok(members) => {
+                let other = members
+                    .iter()
+                    .find(|m| own_id.is_none_or(|o| o != m.user_id()))
+                    .map(|m| m.user_id().to_owned());
+                let other_ref = other.as_ref();
+                let status =
+                    other_ref.and_then(|id| presence_signal.peek().get(id.as_str()).copied());
+                (other.map(|u| u.to_string()), status)
+            }
+            Err(_) => (None, None),
+        }
+    } else {
+        (None, None)
+    };
     Convo {
         id: item.room_id().to_string(),
         kind: if is_dm {
@@ -200,9 +241,9 @@ async fn map_item(item: &RoomListItem) -> Convo {
         last: String::new(),
         unread: counts.notification_count.min(u32::MAX as u64) as u32,
         encrypted: item.encryption_state().is_encrypted(),
-        // DM counterpart MXID resolution lands with presence in checkpoint 06.
-        mxid: None,
-        status: None,
+        // DM counterpart MXID + presence (checkpoint 06).
+        mxid,
+        status,
         topic: item.topic(),
         // Spaces are checkpoint 09.
         space: None,

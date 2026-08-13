@@ -37,6 +37,27 @@ pub fn Conversation(
         move || client.close_timeline(&convo_id)
     });
 
+    // Read receipts (checkpoint 06): mark this room read on mount and again
+    // whenever its live message list advances while the conversation is
+    // mounted. The reactive read of `sync.messages[convo_id]` happens INSIDE
+    // the effect (so it re-runs per publish); `mark_read` is fire-and-forget
+    // and writes no signals, so there's no write-loop hazard.
+    use_effect({
+        let client = client.clone();
+        let convo_id = convo_id.clone();
+        move || {
+            // Subscribe this effect to the live map for this room: a new
+            // publish batch (our own echo or an incoming message) re-runs it.
+            let _len = sync
+                .messages
+                .read()
+                .get(&convo_id)
+                .map(Vec::len)
+                .unwrap_or(0);
+            client.mark_read(&convo_id);
+        }
+    });
+
     // Snapshot path: used by the mock backend (which never publishes the live
     // map) and as first paint before the first timeline batch lands.
     let history = {
@@ -235,6 +256,19 @@ pub fn Conversation(
     } else {
         format!("Message {}", convo.name)
     };
+    // Incoming typing label (checkpoint 06): resolved from the per-room typing
+    // list the backend publishes. Empty → the row renders nothing.
+    let typing_label = sync
+        .typing
+        .read()
+        .get(&convo_id)
+        .cloned()
+        .filter(|t| !t.is_empty())
+        .map(|typing| match typing.len() {
+            1 => format!("{} is typing\u{2026}", typing[0]),
+            2 => format!("{} and {} are typing\u{2026}", typing[0], typing[1]),
+            _ => format!("{} people are typing\u{2026}", typing.len()),
+        });
     let members_label = match convo.kind {
         ConvoKind::Room => format!("{} members", convo.members.unwrap_or(0)),
         ConvoKind::Dm => convo.mxid.clone().unwrap_or_default(),
@@ -446,10 +480,19 @@ pub fn Conversation(
                     }
                 }
             }
+            // Incoming typing row (checkpoint 06): hidden when nobody is
+            // typing. `typing_label` is computed in the body from the live
+            // `sync.typing` map.
+            if let Some(label) = &typing_label {
+                div { style: "padding:2px 24px 0;font-size:12px;color:var(--text-secondary);font-style:italic;min-height:18px;",
+                    "{label}"
+                }
+            }
             Composer {
                 on_send: send,
                 replying_to: replying_to(),
                 on_cancel_reply: move |_| replying_to.set(None),
+                on_typing: move |typing| client.set_typing(&convo_id, typing),
                 placeholder,
             }
         }

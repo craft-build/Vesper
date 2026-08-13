@@ -16,6 +16,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use dioxus_signals::{ReadableExt, WritableExt};
@@ -23,7 +24,7 @@ use futures::StreamExt;
 use matrix_sdk::{
     Client, RoomState,
     ruma::{
-        EventId, OwnedTransactionId, RoomId,
+        EventId, OwnedEventId, OwnedTransactionId, RoomId,
         events::{
             relation::Thread,
             room::message::{
@@ -70,6 +71,21 @@ struct Entry {
     /// the UI; discard goes through `Timeline::redact` on the echo.
     /// Pruned in [`publish`] once an echo resolves to Sent.
     send_handles: Arc<Mutex<Vec<SendHandle>>>,
+    /// Background task driving the incoming-typing signal for this room
+    /// (checkpoint 06); aborted on close so the handler unregisters with it.
+    typing_task: Option<tokio::task::JoinHandle<()>>,
+    /// Throttled read-receipt state (checkpoint 06): the last event id we
+    /// sent a receipt for, and the timestamp of that send (>=1s throttle).
+    receipt: Arc<Mutex<Option<ReceiptState>>>,
+}
+
+/// Per-room read-receipt throttle state. Held under a mutex so the
+/// `mark_read` command (sync) and any deferred send task never race.
+struct ReceiptState {
+    /// The last event id a `m.read` receipt was sent for.
+    last_event: String,
+    /// When that send happened, for the >=1s throttle.
+    last_sent: Instant,
 }
 
 struct ThreadEntry {
@@ -205,6 +221,15 @@ impl TimelineRegistry {
             })
         };
 
+        // Incoming typing (checkpoint 06): the SDK delivers `m.typing`
+        // ephemeral events as a broadcast of typing user ids (own user
+        // already filtered). Resolve each to a display name and publish
+        // into `state.typing[room_id]`; a 10s safety prune clears a stale
+        // entry if a "stopped typing" update is missed. The guard lives for
+        // the task's duration: dropping the task (on close) drops the guard,
+        // unregistering the ephemeral handler.
+        let typing_task = spawn_typing_task(room.clone(), room_id.to_string(), state);
+
         self.entries.insert(
             room_id.to_string(),
             Entry {
@@ -214,6 +239,8 @@ impl TimelineRegistry {
                 refcount: 1,
                 own_id,
                 send_handles,
+                typing_task: Some(typing_task),
+                receipt: Arc::new(Mutex::new(None)),
             },
         );
         tracing::info!(room_id, "timeline opened");
@@ -336,6 +363,18 @@ impl TimelineRegistry {
         if entry.refcount == 0 {
             if let Some(entry) = self.entries.remove(room_id) {
                 entry.task.abort();
+                if let Some(t) = entry.typing_task {
+                    t.abort();
+                }
+                // Clear the published typing row so a reopened room doesn't
+                // show a stale "typing…" from the previous session.
+                if let Some(state) = &self.state {
+                    let mut map = state.typing.peek().clone();
+                    if map.remove(room_id).is_some() {
+                        let mut typing = state.typing;
+                        typing.set(map);
+                    }
+                }
                 tracing::info!(room_id, "timeline closed");
             }
         }
@@ -370,10 +409,65 @@ impl TimelineRegistry {
     pub fn abort_all(&mut self) {
         for (_, entry) in self.entries.drain() {
             entry.task.abort();
+            if let Some(t) = entry.typing_task {
+                t.abort();
+            }
         }
         for (_, entry) in self.threads.drain() {
             entry.task.abort();
         }
+    }
+
+    /// Mark `room_id` as read up to its latest *remote* event (checkpoint 06):
+    /// sends a throttled `m.read` receipt. "Throttled" = >=1s between sends
+    /// and only when the latest event advances past the last-sent one; the
+    /// SDK additionally dedups identical event ids. Runs the actual send on a
+    /// spawned task so the command loop never blocks on the network call.
+    pub fn mark_read(&self, client: &Client, room_id: &str, _state: ClientState) {
+        let Some(entry) = self.entries.get(room_id) else {
+            return;
+        };
+        let latest = latest_remote_event_id(&entry.inner);
+        let Some(event_id) = latest else {
+            // No remote event to receipt yet (only local echoes): nothing to do.
+            return;
+        };
+        let receipt = entry.receipt.clone();
+        let now = Instant::now();
+        {
+            let mut guard = lock(&receipt);
+            match &*guard {
+                Some(r) if r.last_event == event_id => return, // no advance
+                Some(r) if now.duration_since(r.last_sent) < std::time::Duration::from_secs(1) => {
+                    // Too soon: schedule a deferred send for the latest event,
+                    // replacing any pending one. The deferred task re-reads the
+                    // *then-current* latest event from the shared entry state, so
+                    // rapid advances coalesce into one receipt.
+                    let inner = entry.inner.clone();
+                    let room = entry.timeline.room().clone();
+                    let receipt = receipt.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        send_read_receipt_deferred(&room, &inner, &receipt).await;
+                    });
+                    return;
+                }
+                _ => {}
+            }
+            *guard = Some(ReceiptState {
+                last_event: event_id.clone(),
+                last_sent: now,
+            });
+        }
+        let room = entry.timeline.room().clone();
+        let event_id = match EventId::parse(&event_id) {
+            Ok(e) => e.to_owned(),
+            Err(_) => return,
+        };
+        let _ = client; // room is already in hand; client not needed for the send
+        tokio::spawn(async move {
+            send_read_receipt(&room, event_id).await;
+        });
     }
 }
 
@@ -613,6 +707,127 @@ impl TimelineRegistry {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Spawn the incoming-typing task for one room (checkpoint 06). Owns the
+/// `subscribe_to_typing_notifications` drop guard: when this task is aborted
+/// (on close/logout) the guard drops and the ephemeral handler unregisters.
+fn spawn_typing_task(
+    room: matrix_sdk::Room,
+    room_id: String,
+    state: ClientState,
+) -> tokio::task::JoinHandle<()> {
+    let (_guard, mut rx) = room.subscribe_to_typing_notifications();
+    tokio::spawn(async move {
+        use tokio::time::{Duration, timeout};
+        // Keep the guard alive for the task's lifetime; dropping it
+        // unregisters the typing handler.
+        let _guard = _guard;
+        let prune = Duration::from_secs(10);
+        loop {
+            // Either a fresh typing list arrives, or 10s pass with nothing —
+            // a safety prune in case a "stopped typing" update was missed.
+            match timeout(prune, rx.recv()).await {
+                Ok(Ok(user_ids)) => publish_typing(&room, &room_id, user_ids, &state).await,
+                Ok(Err(_)) => break, // channel closed (client dropped)
+                Err(_) => {
+                    // Prune timeout: clear the row if anyone was shown typing.
+                    let mut map = state.typing.peek().clone();
+                    if map.remove(&room_id).is_some() {
+                        let mut typing = state.typing;
+                        typing.set(map);
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Resolve `user_ids` to display names and publish `state.typing[room_id]`.
+async fn publish_typing(
+    room: &matrix_sdk::Room,
+    room_id: &str,
+    user_ids: Vec<matrix_sdk::ruma::OwnedUserId>,
+    state: &ClientState,
+) {
+    let mut names: Vec<String> = Vec::with_capacity(user_ids.len());
+    for id in user_ids {
+        let name = room
+            .get_member(&id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|m| m.display_name().map(str::to_string))
+            .unwrap_or_else(|| id.as_str().to_string());
+        names.push(name);
+    }
+    let mut map = state.typing.peek().clone();
+    let changed = map.get(room_id).cloned() != Some(names.clone());
+    if changed {
+        if names.is_empty() {
+            map.remove(room_id);
+        } else {
+            map.insert(room_id.to_string(), names);
+        }
+        let mut typing = state.typing;
+        typing.set(map);
+    }
+}
+
+/// The latest *remote* (sent) event id in a room's timeline, or `None` when
+/// only local echoes exist. Read receipts must target a real event id.
+fn latest_remote_event_id(inner: &Mutex<EntryState>) -> Option<String> {
+    let guard = lock(inner);
+    guard.items.iter().rev().find_map(|item| match item.kind() {
+        TimelineItemKind::Event(event) => event.event_id().map(ToString::to_string),
+        TimelineItemKind::Virtual(_) => None,
+    })
+}
+
+/// Send an `m.read` receipt for `event_id` (unthreaded) and update throttle
+/// state on success. Failures are logged, never propagated — a missed
+/// receipt is corrected on the next `mark_read`.
+async fn send_read_receipt(room: &matrix_sdk::Room, event_id: OwnedEventId) {
+    use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
+    use matrix_sdk::ruma::events::receipt::ReceiptThread;
+    if let Err(e) = room
+        .send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, event_id)
+        .await
+    {
+        tracing::warn!("read receipt failed: {e}");
+    }
+}
+
+/// Deferred read-receipt send used by the throttle: re-reads the current
+/// latest event from the shared entry state (which may have advanced past the
+/// one that tripped the throttle) and sends for it, updating throttle state.
+async fn send_read_receipt_deferred(
+    room: &matrix_sdk::Room,
+    inner: &Arc<Mutex<EntryState>>,
+    receipt: &Mutex<Option<ReceiptState>>,
+) {
+    let latest = latest_remote_event_id(inner);
+    let Some(event_id) = latest else {
+        return;
+    };
+    {
+        let mut guard = lock(receipt);
+        // If another send already covered this event, skip.
+        if let Some(r) = &*guard {
+            if r.last_event == event_id {
+                return;
+            }
+        }
+        *guard = Some(ReceiptState {
+            last_event: event_id.clone(),
+            last_sent: Instant::now(),
+        });
+    }
+    let event_id = match EventId::parse(&event_id) {
+        Ok(e) => e.to_owned(),
+        Err(_) => return,
+    };
+    send_read_receipt(room, event_id).await;
 }
 
 /// Re-map the whole item list and publish it into `ClientState::messages`.

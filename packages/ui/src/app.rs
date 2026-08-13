@@ -42,11 +42,24 @@ pub fn App() -> Element {
     let messages = use_signal_sync(std::collections::BTreeMap::<String, Vec<data::Message>>::new);
     let threads =
         use_signal_sync(std::collections::BTreeMap::<String, Vec<data::ThreadReply>>::new);
+    // Live state (checkpoint 06): incoming typing + presence are written by
+    // the backend's tokio tasks; `focused` / `active_room` are written by the
+    // UI and read by the desktop-notification task to gate notifications. All
+    // four are sync-storage signals created here in the App scope and never
+    // created off it (the one-map lifecycle; see `ClientState` docs).
+    let typing = use_signal_sync(std::collections::BTreeMap::<String, Vec<String>>::new);
+    let presence = use_signal_sync(std::collections::BTreeMap::<String, data::Presence>::new);
+    let focused = use_signal_sync(|| true);
+    let active_room = use_signal_sync(|| None::<String>);
     let sync_state = ClientState {
         convos,
         connecting,
         messages,
         threads,
+        typing,
+        presence,
+        focused,
+        active_room,
     };
     use_context_provider(|| sync_state);
     use_effect({
@@ -147,6 +160,31 @@ fn Shell() -> Element {
                         ui.nav_open.set(false);
                     }
                     _ => {}
+                }
+            }
+        });
+    });
+
+    // Window focus (checkpoint 06): write `sync.focused` from the browser's
+    // focus/blur + visibilitychange events so the desktop-notification task
+    // can suppress notifications while the user is looking at the app. The
+    // signal is guarded against same-value writes to avoid needlessly
+    // dirtying readers.
+    use_effect(move || {
+        spawn(async move {
+            let mut eval = document::eval(
+                r#"
+                const send = (v) => dioxus.send(v);
+                send(document.hasFocus());
+                window.addEventListener('focus', () => send(true));
+                window.addEventListener('blur', () => send(false));
+                document.addEventListener('visibilitychange', () => send(document.visibilityState === 'visible' && document.hasFocus()));
+                "#,
+            );
+            let mut focused = sync.focused;
+            while let Ok(is_focused) = eval.recv::<bool>().await {
+                if focused() != is_focused {
+                    focused.set(is_focused);
                 }
             }
         });

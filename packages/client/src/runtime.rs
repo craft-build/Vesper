@@ -27,6 +27,7 @@ use tokio::{
 
 use crate::{
     api::{ClientError, ClientState},
+    live::{LiveHandles, TypingManager},
     model::{Convo, Me, Reaction, ThreadReply},
     session, sync,
     timeline::TimelineRegistry,
@@ -131,6 +132,12 @@ pub enum Command {
     OpenThread { room_id: String, root_id: String },
     /// Release one reference to `root_id`'s thread.
     CloseThread { root_id: String },
+    /// Tell the backend the user is (or is not) typing in `room_id`
+    /// (checkpoint 06). Fire-and-forget: debounced + spawned off the loop.
+    SetTyping { room_id: String, typing: bool },
+    /// Mark `room_id` as read up to its latest event (checkpoint 06).
+    /// Fire-and-forget: throttled + spawned off the loop.
+    MarkRead { room_id: String },
 }
 
 /// Post-login send-queue setup (checkpoint 05): make sure the global send
@@ -160,14 +167,22 @@ async fn wire_send_queue(client: &Client) {
 /// (Re)start the room-list sync once both halves exist: an authenticated
 /// client and the UI-bound state. A previously running sync is stopped first,
 /// so a login/rebind never stacks two of them.
+///
+/// Also (re)starts the live-state tasks (presence + notifications, checkpoint
+/// 06): the handlers are re-registered per client, so a previous set is
+/// dropped (unregistered) first.
 async fn restart_sync(
     sdk_client: &Option<Client>,
     bound: &Option<(ClientState, Arc<RwLock<Vec<Convo>>>)>,
     current: &mut Option<sync::SyncHandles>,
+    live: &mut Option<LiveHandles>,
+    typing: &TypingManager,
 ) {
     if let Some(handles) = current.take() {
         handles.stop().await;
     }
+    // Drop previous live handlers (unregisters them) before re-registering.
+    *live = None;
     let (Some(client), Some((state, snapshot))) = (sdk_client, bound) else {
         return;
     };
@@ -181,6 +196,9 @@ async fn restart_sync(
             state.connecting.set(true);
         }
     }
+    // Typing resets per session (no stale timers across a re-login).
+    typing.abort_all();
+    *live = Some(crate::live::start_live(client, *state));
 }
 
 /// Owns the tokio runtime that matrix-sdk code runs on.
@@ -205,6 +223,11 @@ impl ClientRuntime {
                     // running room-list sync built from it + the client.
                     let mut bound: Option<(ClientState, Arc<RwLock<Vec<Convo>>>)> = None;
                     let mut sync: Option<sync::SyncHandles> = None;
+                    // Checkpoint 06: live-state tasks (presence + notifications)
+                    // and the outgoing typing debounce manager. `typing_mgr`
+                    // (not `typing`) to avoid shadowing the command's bool.
+                    let mut live: Option<LiveHandles> = None;
+                    let typing_mgr = TypingManager::default();
                     // Checkpoint 04: live timelines keyed by room id, disposed
                     // when the last reader closes (or on logout below).
                     let mut timelines = TimelineRegistry::default();
@@ -233,7 +256,14 @@ impl ClientRuntime {
                                         wire_send_queue(sdk_client.as_ref().expect("just set"))
                                             .await;
                                         let _ = reply.send(Ok(snapshot));
-                                        restart_sync(&sdk_client, &bound, &mut sync).await;
+                                        restart_sync(
+                                            &sdk_client,
+                                            &bound,
+                                            &mut sync,
+                                            &mut live,
+                                            &typing_mgr,
+                                        )
+                                        .await;
                                     }
                                     Err(e) => {
                                         let _ = reply.send(Err(e));
@@ -246,7 +276,14 @@ impl ClientRuntime {
                                     me = Some(snapshot.clone());
                                     wire_send_queue(sdk_client.as_ref().expect("just set")).await;
                                     let _ = reply.send(Ok(Some(snapshot)));
-                                    restart_sync(&sdk_client, &bound, &mut sync).await;
+                                    restart_sync(
+                                        &sdk_client,
+                                        &bound,
+                                        &mut sync,
+                                        &mut live,
+                                        &typing_mgr,
+                                    )
+                                    .await;
                                 }
                                 Ok(None) => {
                                     let _ = reply.send(Ok(None));
@@ -273,10 +310,19 @@ impl ClientRuntime {
                                 // published messages alongside the convo list
                                 // so a later login never paints stale history.
                                 timelines.abort_all();
+                                // Live-state tasks die with the session too:
+                                // drop the handlers (unregister) and cancel any
+                                // pending typing timers, and blank the
+                                // typing/presence maps so a later login never
+                                // shows stale indicators.
+                                live = None;
+                                typing_mgr.abort_all();
                                 if let Some((state, _)) = &bound {
                                     let mut state = *state;
                                     state.messages.set(Default::default());
                                     state.threads.set(Default::default());
+                                    state.typing.set(Default::default());
+                                    state.presence.set(Default::default());
                                 }
                                 // Take the client (by value) so the session
                                 // module can drop it — closing sqlite handles —
@@ -290,7 +336,14 @@ impl ClientRuntime {
                             }
                             Command::BindState { state, snapshot } => {
                                 bound = Some((state, snapshot));
-                                restart_sync(&sdk_client, &bound, &mut sync).await;
+                                restart_sync(
+                                    &sdk_client,
+                                    &bound,
+                                    &mut sync,
+                                    &mut live,
+                                    &typing_mgr,
+                                )
+                                .await;
                             }
                             Command::OpenTimeline { room_id } => {
                                 if let (Some(client), Some((state, _))) = (&sdk_client, &bound) {
@@ -363,6 +416,16 @@ impl ClientRuntime {
                             }
                             Command::CloseThread { root_id } => {
                                 timelines.close_thread(&root_id);
+                            }
+                            Command::SetTyping { room_id, typing } => {
+                                if let Some(client) = &sdk_client {
+                                    typing_mgr.set(client, &room_id, typing);
+                                }
+                            }
+                            Command::MarkRead { room_id } => {
+                                if let (Some(client), Some((state, _))) = (&sdk_client, &bound) {
+                                    timelines.mark_read(client, &room_id, *state);
+                                }
                             }
                         }
                     }

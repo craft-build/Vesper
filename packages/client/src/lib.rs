@@ -11,6 +11,8 @@ pub mod api;
 pub mod model;
 
 #[cfg(feature = "matrix")]
+pub mod live;
+#[cfg(feature = "matrix")]
 pub mod runtime;
 #[cfg(feature = "matrix")]
 mod session;
@@ -269,6 +271,17 @@ mod matrix_impl {
         fn close_thread(&self, message_id: &str) {
             let _ = self.tx.send(Command::CloseThread {
                 root_id: message_id.to_string(),
+            });
+        }
+        fn set_typing(&self, convo_id: &str, typing: bool) {
+            let _ = self.tx.send(Command::SetTyping {
+                room_id: convo_id.to_string(),
+                typing,
+            });
+        }
+        fn mark_read(&self, convo_id: &str) {
+            let _ = self.tx.send(Command::MarkRead {
+                room_id: convo_id.to_string(),
             });
         }
 

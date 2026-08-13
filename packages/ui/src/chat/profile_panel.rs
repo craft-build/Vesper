@@ -3,7 +3,7 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use super::verify_dialog::VerifyDialog;
-use crate::data::{Convo, Presence, VesperClient};
+use crate::data::{ClientState, Convo, Presence, VesperClient};
 use crate::design_system::{Avatar, Button, ButtonVariant, StatusDot, Tag, TagTone};
 use crate::icons::{Icon, IconName};
 
@@ -60,10 +60,22 @@ pub fn ProfilePanel(
     on_message: EventHandler<ProfileTarget>,
 ) -> Element {
     let client = use_context::<Rc<dyn VesperClient>>();
+    let sync = use_context::<ClientState>();
     let mut verify_open = use_signal(|| false);
     let mut verified = use_signal(|| false);
 
     let mxid = target.mxid.clone().unwrap_or_default();
+
+    // Live presence (checkpoint 06): prefer the backend's presence map for
+    // the contact's MXID, falling back to the snapshot `target.status`, then
+    // Offline. Reading `sync.presence` here subscribes the panel to updates.
+    let presence = sync
+        .presence
+        .read()
+        .get(&mxid)
+        .copied()
+        .or(target.status)
+        .unwrap_or(Presence::Offline);
 
     rsx! {
         div { style: "width:100%;height:100%;display:flex;flex-direction:column;background:var(--bg-canvas);border-left:1px solid var(--border-subtle);",
@@ -79,7 +91,7 @@ pub fn ProfilePanel(
                 span { style: "position:relative;",
                     Avatar { name: "{target.name}", size: 72 }
                     if !target.is_room {
-                        span { style: "position:absolute;right:-2px;bottom:-2px;", StatusDot { status: target.status.unwrap_or(Presence::Offline), size: 14 } }
+                        span { style: "position:absolute;right:-2px;bottom:-2px;", StatusDot { status: presence, size: 14 } }
                     }
                 }
                 div {

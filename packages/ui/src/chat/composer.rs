@@ -10,6 +10,12 @@ pub fn Composer(
     #[props(default = None)] replying_to: Option<Message>,
     #[props(default = None)] on_cancel_reply: Option<EventHandler<()>>,
     #[props(default = String::new())] placeholder: String,
+    /// Typing-notice hook (checkpoint 06): fired `true` on input when the
+    /// composer is non-empty, `false` when it empties or a message is sent.
+    /// The backend debounces a 4s idle reset; the composer just reports
+    /// transitions.
+    #[props(default)]
+    on_typing: EventHandler<bool>,
 ) -> Element {
     let mut val = use_signal(String::new);
     let mut attachment = use_signal(|| Option::<Attachment>::None);
@@ -21,6 +27,7 @@ pub fn Composer(
             return;
         }
         on_send.call((text, att));
+        on_typing.call(false);
         val.set(String::new());
         attachment.set(None);
         if let Some(handler) = &on_cancel_reply {
@@ -67,7 +74,11 @@ pub fn Composer(
                 }
                 textarea {
                     value: "{val}",
-                    oninput: move |evt| val.set(evt.value()),
+                    oninput: move |evt| {
+                        let next = evt.value();
+                        on_typing.call(!next.is_empty());
+                        val.set(next);
+                    },
                     onkeydown: move |evt| {
                         if evt.key() == Key::Enter && !evt.modifiers().shift() {
                             evt.prevent_default();
