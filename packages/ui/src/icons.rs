@@ -47,6 +47,7 @@ pub enum IconName {
     LogOut,
     Grid,
     Maximize,
+    Download,
 }
 
 #[component]
@@ -250,6 +251,11 @@ fn icon_glyph(name: IconName) -> Element {
         IconName::File => rsx! {
             path { d: "M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" }
             path { d: "M14 2v6h6" }
+        },
+        IconName::Download => rsx! {
+            path { d: "M12 3v12" }
+            path { d: "M7 10l5 5 5-5" }
+            path { d: "M4 21h16" }
         },
         IconName::Reply => rsx! {
             path { d: "M9 17l-5-5 5-5" }

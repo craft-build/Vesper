@@ -166,6 +166,7 @@ pub fn Conversation(
                     attachment: attachment.clone(),
                     read_by: Vec::new(),
                     send_state: crate::data::SendState::Sent,
+                    avatar: None,
                 };
                 messages.write().push(optimistic);
             }
@@ -247,6 +248,37 @@ pub fn Conversation(
             // The mock keeps its manually-painted row; nothing to remove.
             spawn(async move {
                 let _ = client.discard_send(&convo_id, &message_id).await;
+            });
+        }
+    };
+
+    // Attachment download (checkpoint 07): the save dialog must live on the
+    // UI thread, the fetch+write goes to the backend. wasm has no rfd — the
+    // button silently no-ops there for now (web is checkpoint 11).
+    let download_attachment = {
+        let client = client.clone();
+        let convo_id = convo_id.clone();
+        move |attachment: crate::data::Attachment| {
+            let client = client.clone();
+            let convo_id = convo_id.clone();
+            let suggested = attachment.name.clone();
+            // NEVER open an rfd modal inside the click handler itself: on
+            // macOS the modal pumps the tao event loop, that nested pump
+            // re-renders/diffs — while the handler's props-owner borrow is
+            // still live below the dialog on the stack ("RefCell already
+            // borrowed" → destructor panic, verified crash). Deferring past
+            // the handler via spawn breaks the overlap.
+            spawn(async move {
+                #[cfg(not(target_arch = "wasm32"))]
+                let dest = rfd::FileDialog::new()
+                    .set_file_name(&suggested)
+                    .save_file()
+                    .map(|p| p.display().to_string());
+                #[cfg(target_arch = "wasm32")]
+                let dest = None::<String>;
+                let _ = suggested; // suppress unused on wasm
+                let Some(dest) = dest else { return };
+                let _ = client.save_attachment(&convo_id, attachment, dest).await;
             });
         }
     };
@@ -477,6 +509,7 @@ pub fn Conversation(
                         on_discard_send: discard_send.clone(),
                         on_open_thread,
                         on_open_profile,
+                        on_download: download_attachment.clone(),
                     }
                 }
             }

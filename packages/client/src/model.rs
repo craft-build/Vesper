@@ -9,6 +9,9 @@
 pub struct Me {
     pub name: String,
     pub id: String,
+    /// Own account avatar (`mxc://`) from the profile lookup (checkpoint 07);
+    /// initials fallback when unset/unresolved.
+    pub avatar: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +42,9 @@ pub struct Convo {
     pub last: String,
     pub unread: u32,
     pub encrypted: bool,
+    /// Room avatar (`mxc://`) for rooms, counterpart member avatar for DMs
+    /// (checkpoint 07). `None` → initials fallback.
+    pub avatar: Option<String>,
 
     // DM-only
     pub mxid: Option<String>,
@@ -60,13 +66,59 @@ impl Convo {
 pub enum AttachmentKind {
     Image,
     File,
+    /// Video/audio are rendered as file cards in the UI (no player in
+    /// checkpoint 07); the distinct kinds keep icons and stats honest.
+    Video,
+    Audio,
 }
 
+/// An attachment on a message, or one staged for upload from the composer
+/// (checkpoint 07). MXC media metadata is mapped from `m.image`/`m.file`
+/// event content; `local_path` travels the other way — set when a file is
+/// picked for sending, consumed by the backend's upload path, and never
+/// appears on a row published by the backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
     pub kind: AttachmentKind,
     pub name: String,
+    /// Human-readable size for file cards (e.g. `340 KB`).
     pub size: String,
+    /// `mxc://` URI of the media (plain) or of the encrypted blob that
+    /// `encrypted` describes.
+    pub mxc: Option<String>,
+    pub mime: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// `mxc://` URI of a server-generated thumbnail (avatars are thumbed
+    /// server-side from `mxc` directly; this is the event's declared
+    /// thumbnail).
+    pub thumb_mxc: Option<String>,
+    /// Serialized ruma `EncryptedFile` JSON when the media is encrypted
+    /// (E2EE rooms). Plain JSON keeps the trait seam free of ruma types.
+    pub encrypted: Option<String>,
+    /// Serialized ruma `EncryptedFile` JSON for `thumb_mxc`, same idea.
+    pub thumb_encrypted: Option<String>,
+    /// Composer staging only: path of a picked local file pending upload.
+    pub local_path: Option<String>,
+}
+
+impl Attachment {
+    /// A received-message attachment with no media metadata resolved yet.
+    pub fn new(kind: AttachmentKind, name: String, size: String) -> Self {
+        Self {
+            kind,
+            name,
+            size,
+            mxc: None,
+            mime: None,
+            width: None,
+            height: None,
+            thumb_mxc: None,
+            encrypted: None,
+            thumb_encrypted: None,
+            local_path: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +157,9 @@ pub struct Message {
     pub attachment: Option<Attachment>,
     pub read_by: Vec<String>,
     pub send_state: SendState,
+    /// Sender avatar (`mxc://`) from the event's sender profile
+    /// (checkpoint 07). `None` → initials fallback.
+    pub avatar: Option<String>,
 }
 
 impl Message {
@@ -127,6 +182,7 @@ impl Message {
             attachment: None,
             read_by: Vec::new(),
             send_state: SendState::Sent,
+            avatar: None,
         }
     }
 }

@@ -12,6 +12,9 @@ mod switcher;
 mod thread_panel;
 mod verify_dialog;
 
+pub mod media;
+pub use media::use_media_src;
+
 pub use app_shell::AppShell;
 pub use call_screen::{CallScreen, CallState};
 pub use chat_view::ChatView;

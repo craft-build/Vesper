@@ -22,7 +22,7 @@ fn row(item: &Convo, is_dm: bool, active_id: &str, on_select: EventHandler<Strin
             onclick: move |_| on_select.call(id.clone()),
             style: "width:100%;display:flex;align-items:center;gap:10px;padding:8px 10px;background:{bg};border:none;border-radius:var(--radius-md);cursor:pointer;text-align:left;margin-bottom:2px;",
             span { style: "position:relative;flex-shrink:0;",
-                Avatar { name: "{item.name}", size: 32 }
+                Avatar { name: "{item.name}", size: 32, mxc: item.avatar.clone() }
                 if is_dm {
                     span { style: "position:absolute;right:-2px;bottom:-2px;", StatusDot { status, size: 9 } }
                 }
@@ -38,6 +38,7 @@ fn row(item: &Convo, is_dm: bool, active_id: &str, on_select: EventHandler<Strin
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drawer_body(
     dms: &[Convo],
     rooms: &[Convo],
@@ -47,6 +48,7 @@ fn drawer_body(
     on_open_discovery: EventHandler<()>,
     on_open_settings: EventHandler<()>,
     on_open_self: EventHandler<()>,
+    me_avatar: Option<String>,
 ) -> Element {
     rsx! {
         div { style: "width:280px;height:100%;background:var(--bg-surface);display:flex;flex-direction:column;",
@@ -90,7 +92,7 @@ fn drawer_body(
                 button {
                     onclick: move |_| on_open_self.call(()),
                     style: "background:none;border:none;color:var(--text-secondary);cursor:pointer;padding:8px;border-radius:var(--radius-md);display:flex;",
-                    Avatar { name: "You", size: 20 }
+                    Avatar { name: "You", size: 20, mxc: me_avatar.clone() }
                 }
             }
         }
@@ -107,19 +109,22 @@ pub fn NavDrawer(
     on_open_discovery: EventHandler<()>,
     on_open_settings: EventHandler<()>,
     on_open_self: EventHandler<()>,
+    /// Signed-in account's avatar MXC (checkpoint 07) for the "You" button.
+    #[props(default = None)]
+    me_avatar: Option<String>,
     #[props(default = false)] inline: bool,
 ) -> Element {
     if inline {
         rsx! {
             div { style: "width:280px;flex-shrink:0;height:100%;border-right:1px solid var(--border-subtle);",
-                {drawer_body(&dms, &rooms, &active_id, on_select, on_close, on_open_discovery, on_open_settings, on_open_self)}
+                {drawer_body(&dms, &rooms, &active_id, on_select, on_close, on_open_discovery, on_open_settings, on_open_self, me_avatar.clone())}
             }
         }
     } else {
         rsx! {
             div { onclick: move |_| on_close.call(()), style: "position:absolute;inset:0;background:rgba(0,0,0,0.4);z-index:30;" }
             div { style: "position:absolute;left:0;top:0;bottom:0;z-index:31;box-shadow:var(--shadow-lg);",
-                {drawer_body(&dms, &rooms, &active_id, on_select, on_close, on_open_discovery, on_open_settings, on_open_self)}
+                {drawer_body(&dms, &rooms, &active_id, on_select, on_close, on_open_discovery, on_open_settings, on_open_self, me_avatar.clone())}
             }
         }
     }

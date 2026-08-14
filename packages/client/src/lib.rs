@@ -13,6 +13,8 @@ pub mod model;
 #[cfg(feature = "matrix")]
 pub mod live;
 #[cfg(feature = "matrix")]
+pub mod media;
+#[cfg(feature = "matrix")]
 pub mod runtime;
 #[cfg(feature = "matrix")]
 mod session;
@@ -186,13 +188,14 @@ mod matrix_impl {
             &self,
             convo_id: &str,
             text: String,
-            _attachment: Option<Attachment>,
+            attachment: Option<Attachment>,
             reply_to: Option<String>,
         ) -> Message {
             let send_state = self
                 .ask(move |reply| Command::SendMessage {
                     room_id: convo_id.to_string(),
                     text,
+                    attachment,
                     reply_to,
                     reply,
                 })
@@ -300,6 +303,37 @@ mod matrix_impl {
         }
         async fn join_room(&self, _room_id: &str) -> Result<(), ClientError> {
             Err(Self::unimplemented("join_room"))
+        }
+
+        // Checkpoint 07: media resolve (data URI) and file-card download.
+        async fn media_uri(
+            &self,
+            mxc: &str,
+            encrypted: Option<String>,
+            thumb: Option<(u32, u32)>,
+        ) -> Result<String, ClientError> {
+            let mxc = mxc.to_string();
+            self.ask(move |reply| Command::MediaUri {
+                mxc,
+                encrypted,
+                thumb,
+                reply,
+            })
+            .await
+        }
+
+        async fn save_attachment(
+            &self,
+            _convo_id: &str,
+            attachment: Attachment,
+            dest_path: String,
+        ) -> Result<(), ClientError> {
+            self.ask(move |reply| Command::SaveAttachment {
+                attachment,
+                dest_path,
+                reply,
+            })
+            .await
         }
     }
 }

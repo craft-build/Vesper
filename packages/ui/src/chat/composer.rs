@@ -4,6 +4,56 @@ use crate::data::{Attachment, AttachmentKind, Message};
 use crate::design_system::{Button, ButtonSize, IconButton};
 use crate::icons::{Icon, IconName};
 
+/// Extensions that map to inline-renderable image messages; anything else
+/// sends as `m.file` (mime itself is sniffed from the bytes at send time).
+#[cfg(not(target_arch = "wasm32"))]
+fn kind_of(path: &str) -> AttachmentKind {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+    ) {
+        AttachmentKind::Image
+    } else {
+        AttachmentKind::File
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{} KB", bytes.div_ceil(1_000))
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Native file pick (checkpoint 07). The dialog must run on the UI thread;
+/// the picked path travels into the model's `local_path` — the backend
+/// reads the bytes at send time. wasm has no rfd yet (web: checkpoint 11).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn pick_attachment() -> Option<Attachment> {
+    let file = rfd::FileDialog::new().pick_file()?;
+    let path = file.display().to_string();
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let size = std::fs::metadata(&path)
+        .map(|m| format_size(m.len()))
+        .unwrap_or_default();
+    let mut attachment = Attachment::new(kind_of(&path), name, size);
+    attachment.local_path = Some(path);
+    Some(attachment)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn pick_attachment() -> Option<Attachment> {
+    None
+}
+
 #[component]
 pub fn Composer(
     on_send: EventHandler<(String, Option<Attachment>)>,
@@ -66,7 +116,17 @@ pub fn Composer(
             div { style: "display:flex;align-items:flex-end;gap:4px;background:var(--bg-surface);border:1px solid var(--border-default);border-radius:var(--radius-lg);padding:6px 8px;",
                 IconButton {
                     label: "Attach file",
-                    onclick: move |_| attachment.set(Some(Attachment { kind: AttachmentKind::File, name: "screenshot.png".into(), size: "340 KB".into() })),
+                    onclick: move |_| {
+                        // Same modal rule as the download save dialog (see
+                        // conversation.rs): opening the picker inside the
+                        // click handler lets its nested event pump re-render
+                        // while this handler's borrow is live → crash.
+                        spawn(async move {
+                            if let Some(picked) = pick_attachment() {
+                                attachment.set(Some(picked));
+                            }
+                        });
+                    },
                     Icon { name: IconName::Paperclip, size: 17 }
                 }
                 div { style: "display:flex;gap:2px;",

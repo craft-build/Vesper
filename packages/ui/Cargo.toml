@@ -20,3 +20,6 @@ client = { workspace = true, default-features = false }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Native-only: enables the `matrix` feature (matrix-sdk + runtime bridge).
 client = { workspace = true, features = ["matrix"] }
+# Checkpoint 07: native pick/save dialogs for attachments. Synchronous on
+# the UI thread (the dialogs must not run on the backend's tokio thread).
+rfd = "0.15"

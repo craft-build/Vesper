@@ -19,6 +19,10 @@ matrix = [
     "dep:eyeball-im",
     "dep:futures",
     "dep:notify-rust",
+    "dep:image",
+    "dep:infer",
+    "dep:base64",
+    "dep:mime",
 ]
 
 [dependencies]
@@ -42,6 +46,16 @@ futures = { version = "0.3", optional = true }
 # off `wasm32` in the notification task itself — `notify-rust` has no web
 # backend.
 notify-rust = { version = "4", optional = true }
+# Checkpoint 07 media: decode + downscale composer-picked images for
+# thumbnails; sniff picked-file types; encode resolved media as data URIs.
+# Minimal codec set keeps build time down; GIF stays server-thumbnailable
+# (we don't generate static thumbs for it).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
+infer = { version = "0.19", optional = true }
+base64 = { version = "0.22", optional = true }
+# Same version family as matrix-sdk re-exports (attachment::Thumbnail is
+# typed over `mime::Mime`).
+mime = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

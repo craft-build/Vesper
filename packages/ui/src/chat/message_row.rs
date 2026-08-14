@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 
-use crate::data::{AttachmentKind, Message, SendState};
+use crate::chat::use_media_src;
+use crate::data::{Attachment, AttachmentKind, Message, SendState};
 use crate::design_system::Avatar;
 use crate::icons::{Icon, IconName};
 use crate::markdown::render_markdown;
@@ -17,9 +18,30 @@ pub fn MessageRow(
     on_discard_send: EventHandler<String>,
     on_open_thread: EventHandler<String>,
     on_open_profile: EventHandler<String>,
+    /// Download the full-resolution bytes of an attachment via a save
+    /// dialog (checkpoint 07). Also fired by clicking an inline image
+    /// (no lightbox in v1 — documented in docs/07).
+    on_download: EventHandler<Attachment>,
 ) -> Element {
     let mut hover = use_signal(|| false);
     let mut show_emoji = use_signal(|| false);
+
+    // Inline image thumbnails (checkpoint 07): prefer the event's declared
+    // thumbnail source, fall back to the media itself thumbed server-side.
+    // Hook must run unconditionally; non-image rows resolve `None` (no-op).
+    let (img_mxc, img_enc) = m
+        .attachment
+        .as_ref()
+        .filter(|a| a.kind == AttachmentKind::Image)
+        .map(|a| {
+            if a.thumb_mxc.is_some() {
+                (a.thumb_mxc.clone(), a.thumb_encrypted.clone())
+            } else {
+                (a.mxc.clone(), a.encrypted.clone())
+            }
+        })
+        .unwrap_or((None, None));
+    let img_src = use_media_src(img_mxc, img_enc, Some((800, 800)));
 
     if m.system {
         return rsx! {
@@ -58,7 +80,7 @@ pub fn MessageRow(
             button {
                 onclick: { let from = m.from.clone(); move |_| on_open_profile.call(from.clone()) },
                 style: "background:none;border:none;padding:0;cursor:pointer;",
-                Avatar { name: "{m.from}", size: 32 }
+                Avatar { name: "{m.from}", size: 32, mxc: m.avatar.clone() }
             }
             div { style: "max-width:440px;position:relative;",
                 div { style: "display:flex;gap:8px;align-items:baseline;flex-direction:{row_dir};",
@@ -70,9 +92,16 @@ pub fn MessageRow(
                         "{src.from}: {src.text}"
                     }
                 }
-                div {
-                    style: "margin-top:4px;padding:10px 14px;border-radius:var(--radius-md);font-size:14px;line-height:1.45;background:{bubble_bg};color:{bubble_color};border:{bubble_border};",
-                    dangerous_inner_html: "{html}",
+                // While an attachment is present and the event body only
+                // repeats the filename, the card/image carries it — skip the
+                // duplicate bubble. Captions (body != filename) still show.
+                if !m.text.is_empty()
+                    && m.attachment.as_ref().is_none_or(|a| a.name != m.text)
+                {
+                    div {
+                        style: "margin-top:4px;padding:10px 14px;border-radius:var(--radius-md);font-size:14px;line-height:1.45;background:{bubble_bg};color:{bubble_color};border:{bubble_border};",
+                        dangerous_inner_html: "{html}",
+                    }
                 }
                 // Send-state footer (checkpoint 05). Static style strings
                 // only: these nodes mount/unmount with the state change, so
@@ -99,14 +128,58 @@ pub fn MessageRow(
                     }
                 }
                 if let Some(attachment) = &m.attachment {
-                    div { style: "margin-top:6px;display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg-surface-raised);border:1px solid var(--border-subtle);border-radius:var(--radius-md);",
-                        Icon {
-                            name: if attachment.kind == AttachmentKind::Image { IconName::Image } else { IconName::File },
-                            size: 16,
-                            color: "var(--text-brand)".to_string(),
+                    if attachment.kind == AttachmentKind::Image {
+                        {
+                            let w = attachment.width;
+                            let h = attachment.height;
+                            let aspect = match (w, h) {
+                                (Some(w), Some(h)) if w > 0 && h > 0 => format!("aspect-ratio:{w}/{h};"),
+                                _ => String::new(),
+                            };
+                            let att_dl = attachment.clone();
+                            rsx! {
+                                button {
+                                    title: "Download full image",
+                                    onclick: move |_| on_download.call(att_dl.clone()),
+                                    style: "margin-top:6px;display:block;padding:0;border:1px solid var(--border-subtle);border-radius:var(--radius-md);overflow:hidden;background:var(--bg-surface-raised);cursor:pointer;max-width:440px;max-height:400px;",
+                                    if let Some(src) = &img_src {
+                                        img {
+                                            src: "{src}",
+                                            alt: "{attachment.name}",
+                                            style: "{aspect}display:block;max-width:100%;max-height:400px;object-fit:cover;",
+                                        }
+                                    } else {
+                                        // Placeholder keeps the reported aspect so the
+                                        // history scroll position doesn't jump on load.
+                                        div { style: "{aspect}width:100%;min-width:200px;min-height:120px;display:flex;align-items:center;justify-content:center;color:var(--text-tertiary);",
+                                            Icon { name: IconName::Image, size: 28 }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        span { style: "font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", "{attachment.name}" }
-                        span { style: "font-size:11px;color:var(--text-tertiary);font-family:var(--font-mono);", "{attachment.size}" }
+                    } else {
+                        div { style: "margin-top:6px;display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg-surface-raised);border:1px solid var(--border-subtle);border-radius:var(--radius-md);",
+                            Icon {
+                                name: match attachment.kind {
+                                    AttachmentKind::Video => IconName::Video,
+                                    _ => IconName::File,
+                                },
+                                size: 16,
+                                color: "var(--text-brand)".to_string(),
+                            }
+                            span { style: "font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", "{attachment.name}" }
+                            span { style: "font-size:11px;color:var(--text-tertiary);font-family:var(--font-mono);", "{attachment.size}" }
+                            button {
+                                title: "Download",
+                                onclick: {
+                                    let att_dl = attachment.clone();
+                                    move |_| on_download.call(att_dl.clone())
+                                },
+                                style: "background:none;border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;padding:3px 6px;",
+                                Icon { name: IconName::Download, size: 13 }
+                            }
+                        }
                     }
                 }
                 if !m.reactions.is_empty() {

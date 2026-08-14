@@ -3,7 +3,7 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use super::verify_dialog::VerifyDialog;
-use crate::data::{ClientState, Convo, Presence, VesperClient};
+use crate::data::{ClientState, Convo, Me, Presence, VesperClient};
 use crate::design_system::{Avatar, Button, ButtonVariant, StatusDot, Tag, TagTone};
 use crate::icons::{Icon, IconName};
 
@@ -19,6 +19,8 @@ pub struct ProfileTarget {
     pub topic: Option<String>,
     pub members: Option<u32>,
     pub encrypted: bool,
+    /// Room/counterpart avatar MXC (checkpoint 07); initials fallback.
+    pub avatar: Option<String>,
 }
 
 impl From<Convo> for ProfileTarget {
@@ -33,6 +35,7 @@ impl From<Convo> for ProfileTarget {
             topic: c.topic,
             members: c.members,
             encrypted: c.encrypted,
+            avatar: c.avatar,
         }
     }
 }
@@ -48,6 +51,23 @@ impl ProfileTarget {
             topic: None,
             members: None,
             encrypted: false,
+            avatar: None,
+        }
+    }
+
+    /// The signed-in user's own profile (nav drawer "You" button,
+    /// checkpoint 07): carries the account avatar MXC when known.
+    pub fn own(me: &Me) -> Self {
+        Self {
+            id: None,
+            name: me.name.clone(),
+            mxid: Some(me.id.clone()),
+            status: Some(Presence::Online),
+            is_room: false,
+            topic: None,
+            members: None,
+            encrypted: false,
+            avatar: me.avatar.clone(),
         }
     }
 }
@@ -89,7 +109,7 @@ pub fn ProfilePanel(
             }
             div { style: "flex:1;overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:18px;align-items:center;text-align:center;",
                 span { style: "position:relative;",
-                    Avatar { name: "{target.name}", size: 72 }
+                    Avatar { name: "{target.name}", size: 72, mxc: target.avatar.clone() }
                     if !target.is_room {
                         span { style: "position:absolute;right:-2px;bottom:-2px;", StatusDot { status: presence, size: 14 } }
                     }

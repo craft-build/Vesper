@@ -10,7 +10,7 @@ use super::switcher::Switcher;
 use super::thread_panel::ThreadPanel;
 use super::{CallScreen, CallState, ChatUiState, ProfileTarget, SidePanel};
 use crate::app::Route;
-use crate::data::{ClientState, ConvoKind, VesperClient};
+use crate::data::{ClientState, ConvoKind, Me, VesperClient};
 use crate::icons::Icon;
 use crate::window_chrome::{DragStrip, WindowControls};
 
@@ -19,6 +19,10 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
     let client = use_context::<Rc<dyn VesperClient>>();
     let mut ui = use_context::<ChatUiState>();
     let navigator = use_navigator();
+    // The signed-in account (checkpoint 07): powers the "You" footer
+    // avatar and the self profile panel.
+    let me: Option<Me> = use_context::<Signal<Option<Me>>>()();
+    let me_avatar = me.as_ref().and_then(|m| m.avatar.clone());
 
     // Live list: written by the backend's sync task (checkpoint 03), so the
     // drawer and switcher re-render as rooms/unread counts change — no fetch.
@@ -195,7 +199,11 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                     on_close: move |_| ui.nav_open.set(false),
                     on_open_discovery: move |_| ui.discovery_open.set(true),
                     on_open_settings: move |_| { ui.nav_open.set(false); navigator.push(Route::SettingsPage {}); },
-                    on_open_self: move |_| { ui.nav_open.set(false); ui.side_panel.set(Some(SidePanel::Profile { target: ProfileTarget::person("You", "@you:vesper.chat") })); },
+                    on_open_self: {
+                        let me = me.clone();
+                        move |_| { ui.nav_open.set(false); ui.side_panel.set(Some(SidePanel::Profile { target: me.as_ref().map(ProfileTarget::own).unwrap_or_else(|| ProfileTarget::person("You", "@you:vesper.chat")) })); }
+                    },
+                    me_avatar: me_avatar.clone(),
                     inline: true,
                 }
             }
@@ -271,7 +279,11 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                     on_close: move |_| ui.nav_open.set(false),
                     on_open_discovery: move |_| ui.discovery_open.set(true),
                     on_open_settings: move |_| { ui.nav_open.set(false); navigator.push(Route::SettingsPage {}); },
-                    on_open_self: move |_| { ui.nav_open.set(false); ui.side_panel.set(Some(SidePanel::Profile { target: ProfileTarget::person("You", "@you:vesper.chat") })); },
+                    on_open_self: {
+                        let me = me.clone();
+                        move |_| { ui.nav_open.set(false); ui.side_panel.set(Some(SidePanel::Profile { target: me.as_ref().map(ProfileTarget::own).unwrap_or_else(|| ProfileTarget::person("You", "@you:vesper.chat")) })); }
+                    },
+                    me_avatar: me_avatar.clone(),
                     inline: false,
                 }
             }

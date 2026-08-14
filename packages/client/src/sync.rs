@@ -209,22 +209,30 @@ async fn map_item(
     let counts = item.unread_notification_counts();
     // DM counterpart: the other joined member. Falls back to `None` when
     // member state hasn't synced yet — the dot stays Offline until it does.
-    let (mxid, status) = if is_dm {
+    // The DM avatar overrides the room avatar with the counterpart's
+    // (checkpoint 07).
+    let (mxid, status, avatar) = if is_dm {
         match item.members(RoomMemberships::JOIN).await {
             Ok(members) => {
                 let other = members
                     .iter()
-                    .find(|m| own_id.is_none_or(|o| o != m.user_id()))
-                    .map(|m| m.user_id().to_owned());
+                    .find(|m| own_id.is_none_or(|o| o != m.user_id()));
+                // `item.avatar_url()` is DM-aware (counterpart avatar) —
+                // use it whenever the counterpart's member profile is
+                // missing or has no avatar of its own.
+                let avatar = other
+                    .and_then(|m| m.avatar_url().map(|u| u.to_string()))
+                    .or_else(|| item.avatar_url().map(|u| u.to_string()));
+                let other = other.map(|m| m.user_id().to_owned());
                 let other_ref = other.as_ref();
                 let status =
                     other_ref.and_then(|id| presence_signal.peek().get(id.as_str()).copied());
-                (other.map(|u| u.to_string()), status)
+                (other.map(|u| u.to_string()), status, avatar)
             }
-            Err(_) => (None, None),
+            Err(_) => (None, None, None),
         }
     } else {
-        (None, None)
+        (None, None, item.avatar_url().map(|u| u.to_string()))
     };
     Convo {
         id: item.room_id().to_string(),
@@ -241,6 +249,8 @@ async fn map_item(
         last: String::new(),
         unread: counts.notification_count.min(u32::MAX as u64) as u32,
         encrypted: item.encryption_state().is_encrypted(),
+        // Room/counterpart avatar (checkpoint 07).
+        avatar,
         // DM counterpart MXID + presence (checkpoint 06).
         mxid,
         status,

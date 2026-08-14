@@ -184,7 +184,16 @@ async fn me_snapshot(client: &Client) -> Me {
                 .unwrap_or(&id)
                 .to_owned()
         });
-    Me { name, id }
+    // Own avatar (checkpoint 07): account profile MXC, consumed by the
+    // "You" footer button and the self profile panel.
+    let avatar = client
+        .account()
+        .get_avatar_url()
+        .await
+        .ok()
+        .flatten()
+        .map(|u| u.to_string());
+    Me { name, id, avatar }
 }
 
 /// Full password login against `homeserver`. On success the fresh session is

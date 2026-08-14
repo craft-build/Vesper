@@ -101,3 +101,66 @@ with progress and correct `m.image`/`m.file` events.
 > panel via a shared cached lookup. For encrypted rooms use the SDK
 > attachment encryption helpers; if blocked, scope-limit and document. Verify
 > byte-exact round trip and Element interop.
+
+## Implementation notes (as built)
+
+- **Store wiring needed no code**: `ClientBuilder::sqlite_store` already
+  opens a `SqliteMediaStore` alongside the state/event-cache stores
+  (builder/mod.rs in matrix-sdk 0.18). All fetches go through
+  `Media::get_media_content(.., use_cache = true)`, so the persistence
+  criterion ("relaunch → cache, not network") is satisfied by construction.
+- **Data-URI, not file paths (deviation)**: dioxus-desktop 0.7's asset
+  protocol only serves bundled assets and component-registered asset
+  handlers — a bare filesystem path in `img { src }` never loads. Every
+  resolver therefore returns `data:{mime};base64,…`, sized small by using
+  the homeserver thumbnail API at display size (avatars 128px, inline
+  images ≤800px). This also collapses the planned native/web divergence:
+  data URIs work identically on the wasm target, so the checkpoint-11
+  blob-URL work is unnecessary unless payload size becomes an issue.
+  Thumbnail fetch failures fall back to full content (e.g. SVG — the
+  thumbnail API can't scale it server-side).
+- **No local echo for attachments**: matrix-sdk-ui 0.18's
+  `send_attachment` "does not currently support local echoes" — sent media
+  appears in the conversation only when the remote echo syncs back.
+  Checkpoint-05's send-state/retry rails deliberately do not apply. So a
+  silent spawned-task failure would swallow a whole message: the runtime
+  therefore runs a synchronous preflight before answering the send command
+  (picked file must open, `reply_to` must parse an event id — replies to
+  pending `txn-` echoes fail *visibly* instead of vanishing). Failures
+  after preflight (network, room errors) remain `tracing::warn`ed, as a
+  media send has no failed-row to repaint; surfacing those is a follow-up
+  (e.g. sdk-ui's experimental send-queue media echo). Uploads run in a
+  spawned task off the sequential runtime command loop (the checkpoint-06
+  blocking lesson).
+- **Encryption is transparent**: `Room::send_attachment(..).store_in_cache()`
+  encrypts upload+thumbnail automatically in encrypted rooms; downloads and
+  thumbnail fetches decrypt via `MediaSource::Encrypted`. The encrypted
+  `EncryptedFile` blob crosses the trait seam as serialized JSON
+  (`Attachment.encrypted` / `thumb_encrypted`) to keep ruma types out of
+  the UI. So the "encrypted media as top follow-up" escape hatch was not
+  needed — it works by construction.
+- **Compose flow**: picker only (rfd native dialog, sync, on the UI thread
+  — a dialog on the backend's tokio thread would be wrong; drag/paste
+  remains a follow-up). Kind (image vs file) is a filename-extension
+  heuristic at pick time; the real mime is sniffed from bytes with `infer`
+  at send. Thumbnails: ≤800px JPEG via the `image` crate (features jpeg /
+  png / webp only); animated GIFs intentionally get no static thumbnail
+  (servers can thumb them). Caption = composer text, sent through
+  `AttachmentConfig.caption` (body differs from filename → Element
+  renders it as a caption).
+- **Rendering**: `ClientState::media` (App-scope `Signal<BTreeMap>`) memoizes
+  resolved data URIs; a small `use_media_src` hook reads the cache at
+  render time (subscribing each consumer) and kicks off resolution once on
+  mount. MXC content is content-addressed, so the map never invalidates —
+  the memory bound is a checkpoint-11 candidate (`Media::clean()`/retention
+  policy exists). Avatars resolve at 128px. `MessageRow` renders inline
+  images inside an aspect-ratio box from `info.{w,h}` (no layout jump) with
+  a placeholder icon while loading; clicking the image downloads full-size
+  — **no lightbox in v1** (scoped out deliberately).
+- **Downloads**: `MessageRow` file cards (and the image click) → rfd save
+  dialog on the UI thread → `save_attachment(convo_id, attachment, dest)`
+  writes the full-resolution bytes unchanged. Byte-exactness holds: no
+  re-encode on the download path.
+- **Mapped but not interactive**: `m.video`/`m.audio` render as file cards
+  (kinds `Video`/`Audio` exist for icons/labels; no players). Stickers,
+  galleries (msc4274), and thread-panel reply avatars stay unmapped.

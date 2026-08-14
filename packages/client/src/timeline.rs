@@ -60,6 +60,10 @@ struct EntryState {
 
 struct Entry {
     timeline: Timeline,
+    /// Room handle for operations that don't go through the timeline (e.g.
+    /// attachment uploads, checkpoint 07 — `Timeline` is not `Clone`, so a
+    /// spawned upload task needs its own `Room` clone).
+    room: matrix_sdk::Room,
     inner: Arc<Mutex<EntryState>>,
     task: tokio::task::JoinHandle<()>,
     refcount: usize,
@@ -234,6 +238,7 @@ impl TimelineRegistry {
             room_id.to_string(),
             Entry {
                 timeline,
+                room,
                 inner,
                 task,
                 refcount: 1,
@@ -478,6 +483,12 @@ fn txn_of(mapped_id: &str) -> Option<String> {
 }
 
 impl TimelineRegistry {
+    /// A cloneable room handle for an open room, used to spawn attachment
+    /// uploads off the sequential command loop (checkpoint 07).
+    pub fn room_for_send(&self, room_id: &str) -> Option<matrix_sdk::Room> {
+        self.entries.get(room_id).map(|e| e.room.clone())
+    }
+
     /// Send a markdown text message into `room_id`'s open timeline, as a
     /// reply when `reply_to` (a mapped row id) is given (checkpoint 05).
     /// The local echo paints through the diff stream; failures land as
@@ -924,6 +935,12 @@ fn map_event(event: &EventTimelineItem, own_id: &str) -> Option<Message> {
             .unwrap_or_else(|| event.sender().to_string()),
         _ => event.sender().to_string(),
     };
+    // Sender avatar MXCs (checkpoint 07) are only known once the profile
+    // resolves; until then rows fall back to initials.
+    let avatar = match event.sender_profile() {
+        TimelineDetails::Ready(profile) => profile.avatar_url.as_ref().map(|u| u.to_string()),
+        _ => None,
+    };
     let time = format_hhmm(event.timestamp().get().into());
 
     let mut msg = |text: String, system: bool| {
@@ -935,7 +952,11 @@ fn map_event(event: &EventTimelineItem, own_id: &str) -> Option<Message> {
     };
 
     match event.content() {
-        TimelineItemContent::MsgLike(msglike) => Some(map_msglike(&mut msg, msglike, own_id)),
+        TimelineItemContent::MsgLike(msglike) => {
+            let mut m = map_msglike(&mut msg, msglike, own_id);
+            m.avatar = avatar;
+            Some(m)
+        }
         TimelineItemContent::MembershipChange(change) => Some(msg(membership_text(change), true)),
         TimelineItemContent::ProfileChange(profile) => {
             let text = match profile.displayname_change() {
@@ -974,6 +995,7 @@ fn map_msglike(
         .as_ref()
         .map(|details| details.event_id.to_string());
 
+    let mut attachment = None;
     let (text, system) = match &msglike.kind {
         MsgLikeKind::Message(message) => {
             use matrix_sdk::ruma::events::room::message::MessageType as T;
@@ -981,10 +1003,29 @@ fn map_msglike(
                 T::Text(t) => t.body.clone(),
                 T::Notice(n) => n.body.clone(),
                 T::Emote(e) => return emote_row(msg, &e.body, own_id, msglike),
-                // Real attachment rendering is checkpoint 07; the body here is
-                // the filename/caption.
-                T::Image(_) | T::File(_) | T::Audio(_) | T::Video(_) => {
-                    format!("[attachment: {}]", message.body())
+                // Checkpoint 07: real attachment mapping — the event body is
+                // kept as the row text (element conventions: caption when it
+                // differs from the filename); MessageRow hides a bubble that
+                // only repeats the filename.
+                T::Image(i) => {
+                    let media = crate::media::MappedMedia::from(i);
+                    attachment = Some(media.attachment);
+                    media.body
+                }
+                T::File(f) => {
+                    let media = crate::media::MappedMedia::from(f);
+                    attachment = Some(media.attachment);
+                    media.body
+                }
+                T::Video(v) => {
+                    let media = crate::media::MappedMedia::from(v);
+                    attachment = Some(media.attachment);
+                    media.body
+                }
+                T::Audio(a) => {
+                    let media = crate::media::MappedMedia::from(a);
+                    attachment = Some(media.attachment);
+                    media.body
                 }
                 T::Location(l) => format!("[location: {}]", l.geo_uri),
                 T::ServerNotice(n) => n.body.clone(),
@@ -1011,6 +1052,7 @@ fn map_msglike(
     let mut m = msg(text, system);
     m.reactions = reactions;
     m.reply_to = reply_to;
+    m.attachment = attachment;
     // Thread root reply count ("N replies" badge), from the SDK's thread
     // summary; updates through the same diff batch as the reply lands.
     m.thread_count = msglike

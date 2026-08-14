@@ -12,7 +12,7 @@ fn result_row(item: &Convo, on_select: EventHandler<String>) -> Element {
             key: "{item.id}",
             onclick: move |_| on_select.call(id.clone()),
             style: "width:100%;display:flex;align-items:center;gap:10px;padding:9px 10px;background:transparent;border:none;border-radius:var(--radius-md);cursor:pointer;text-align:left;",
-            Avatar { name: "{item.name}", size: 30 }
+            Avatar { name: "{item.name}", size: 30, mxc: item.avatar.clone() }
             span { style: "flex:1;min-width:0;",
                 div { style: "font-size:14px;font-weight:600;display:flex;align-items:center;gap:4px;",
                     if is_room {

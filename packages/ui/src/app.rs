@@ -51,6 +51,7 @@ pub fn App() -> Element {
     let presence = use_signal_sync(std::collections::BTreeMap::<String, data::Presence>::new);
     let focused = use_signal_sync(|| true);
     let active_room = use_signal_sync(|| None::<String>);
+    let media = use_signal_sync(std::collections::BTreeMap::<String, String>::new);
     let sync_state = ClientState {
         convos,
         connecting,
@@ -60,6 +61,7 @@ pub fn App() -> Element {
         presence,
         focused,
         active_room,
+        media,
     };
     use_context_provider(|| sync_state);
     use_effect({

@@ -79,7 +79,7 @@ pub fn ThreadPanel(
             div { style: "flex:1;overflow-y:auto;padding:16px 18px;display:flex;flex-direction:column;gap:14px;",
                 if let Some(root) = &root_message {
                     div { style: "display:flex;gap:10px;",
-                        Avatar { name: "{root.from}", size: 30 }
+                        Avatar { name: "{root.from}", size: 30, mxc: root.avatar.clone() }
                         div {
                             div { style: "font-size:13px;font-weight:600;",
                                 "{root.from} "

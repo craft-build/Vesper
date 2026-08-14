@@ -28,7 +28,7 @@ use tokio::{
 use crate::{
     api::{ClientError, ClientState},
     live::{LiveHandles, TypingManager},
-    model::{Convo, Me, Reaction, ThreadReply},
+    model::{Attachment, Convo, Me, Reaction, ThreadReply},
     session, sync,
     timeline::TimelineRegistry,
 };
@@ -86,10 +86,33 @@ pub enum Command {
     },
     /// Send a markdown text message into `room_id`'s open timeline,
     /// optionally as an in-reply-to on `reply_to` (checkpoint 05).
+    /// When `attachment` is present (checkpoint 07, a composer-picked file
+    /// staging `local_path`), the text becomes the caption and the file is
+    /// uploaded + sent as `m.image`/`m.file`/… in a spawned task — the
+    /// reply returns immediately so a slow upload never stalls the
+    /// sequential command loop (checkpoint-06 lesson).
     SendMessage {
         room_id: String,
         text: String,
+        attachment: Option<Attachment>,
         reply_to: Option<String>,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    /// Resolve media to a `data:` URI string (checkpoint 07). `encrypted`
+    /// carries serialized `EncryptedFile` JSON for E2EE media. Answered
+    /// from a spawned task once the (cache-aware) fetch completes — the
+    /// command loop keeps processing peers meanwhile.
+    MediaUri {
+        mxc: String,
+        encrypted: Option<String>,
+        thumb: Option<(u32, u32)>,
+        reply: oneshot::Sender<Result<String, ClientError>>,
+    },
+    /// Save an attachment's full-resolution bytes to `dest_path`
+    /// (checkpoint 07 Download action). Answered from a spawned task.
+    SaveAttachment {
+        attachment: Attachment,
+        dest_path: String,
         reply: oneshot::Sender<Result<(), ClientError>>,
     },
     /// Send a markdown text message as an `m.thread` reply rooted at
@@ -359,11 +382,81 @@ impl ClientRuntime {
                             Command::SendMessage {
                                 room_id,
                                 text,
+                                attachment,
                                 reply_to,
                                 reply,
+                            } => match attachment {
+                                None => {
+                                    let _ = reply.send(
+                                        timelines.send_message(&room_id, text, reply_to).await,
+                                    );
+                                }
+                                Some(att) => {
+                                    // Validate before answering: media sends
+                                    // have no local echo, so an opaque
+                                    // spawned-task failure would silently
+                                    // swallow the message (review P2).
+                                    if let Err(e) = crate::media::preflight_attachment(
+                                        &att,
+                                        reply_to.as_deref(),
+                                    ) {
+                                        let _ = reply.send(Err(e));
+                                        continue;
+                                    }
+                                    match timelines.room_for_send(&room_id) {
+                                        Some(room) => {
+                                            tokio::spawn(crate::media::send_attachment(
+                                                room, att, text, reply_to,
+                                            ));
+                                            let _ = reply.send(Ok(()));
+                                        }
+                                        None => {
+                                            let _ = reply.send(Err(ClientError(
+                                                "That conversation is not open.".into(),
+                                            )));
+                                        }
+                                    }
+                                }
+                            },
+                            Command::MediaUri {
+                                mxc,
+                                encrypted,
+                                thumb,
+                                reply,
                             } => {
-                                let _ = reply
-                                    .send(timelines.send_message(&room_id, text, reply_to).await);
+                                // Answered from a spawned task: cache misses
+                                // are network fetches and the command loop is
+                                // sequential (checkpoint-06 lesson).
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                tokio::spawn(async move {
+                                    let result = crate::media::resolve(
+                                        &client,
+                                        &mxc,
+                                        encrypted.as_deref(),
+                                        thumb,
+                                    )
+                                    .await;
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Command::SaveAttachment {
+                                attachment,
+                                dest_path,
+                                reply,
+                            } => {
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                tokio::spawn(async move {
+                                    let result =
+                                        crate::media::save_to(&client, &attachment, &dest_path)
+                                            .await;
+                                    let _ = reply.send(result);
+                                });
                             }
                             Command::SendThreadReply {
                                 room_id,

@@ -1,11 +1,26 @@
 use dioxus::prelude::*;
 
+use crate::chat::use_media_src;
+
 #[component]
 pub fn Avatar(
     #[props(default = String::new())] name: String,
     #[props(default = 40)] size: i64,
     #[props(default = None)] src: Option<String>,
+    /// MXC avatar URI (checkpoint 07): resolved through the SDK media cache
+    /// to a thumbnail `data:` URI; initials remain the fallback while/never
+    /// resolved. Explicit `src` wins over `mxc`.
+    #[props(default = None)]
+    mxc: Option<String>,
 ) -> Element {
+    // Hooks can't be conditional: pass `None` when an explicit `src` makes
+    // resolution unnecessary (the effect no-ops on `None`).
+    let resolved = use_media_src(
+        if src.is_some() { None } else { mxc },
+        None,
+        Some((128, 128)),
+    );
+    let src = src.or(resolved);
     let initials: String = name
         .trim()
         .split_whitespace()

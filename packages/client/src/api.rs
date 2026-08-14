@@ -67,6 +67,14 @@ pub struct ClientState {
     /// desktop notification task to suppress notifications for the room the
     /// user is already in. `None` when no room is open.
     pub active_room: Signal<Option<String>, SyncStorage>,
+    /// In-memory cache of resolved media (checkpoint 07): `data:` URI strings
+    /// keyed by `"{mxc}|{w}x{h}"` for thumbnails or `"{mxc}"` for full
+    /// content. UI-written by the media-resolution hook after each
+    /// [`VesperClient::media_uri`] fetch, read-first by every resolver so
+    /// repeated avatars/images of the same MXC never refetch (no flicker).
+    /// MXC media is content-addressed, so entries never need invalidation;
+    /// on-disk persistence across restarts is the SqliteMediaStore's job.
+    pub media: Signal<BTreeMap<String, String>, SyncStorage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,4 +213,44 @@ pub trait VesperClient {
     async fn public_rooms(&self) -> Vec<PublicRoom>;
     async fn public_spaces(&self) -> Vec<PublicSpace>;
     async fn join_room(&self, room_id: &str) -> Result<(), ClientError>;
+
+    /// Resolve media to a renderable URL (checkpoint 07): returns a `data:`
+    /// URI (base64) the webview can place directly in `img { src }`.
+    ///
+    /// `encrypted` carries a serialized ruma `EncryptedFile` JSON blob for
+    /// E2EE media (see [`Attachment::encrypted`]); the backend decrypts
+    /// transparently. `thumb` requests a server-side thumbnail of up to
+    /// `w×h` pixels, falling back to the full content when the server can't
+    /// thumbnail the type (e.g. SVG).
+    ///
+    /// A `data:` URI — not a file path as docs/07 first sketched — because
+    /// dioxus-desktop's asset protocol serves only bundled assets and
+    /// registered asset-handler routes; bare filesystem paths don't resolve
+    /// in the webview. Data URIs also work identically on the (future
+    /// wasm) web target.
+    async fn media_uri(
+        &self,
+        _mxc: &str,
+        _encrypted: Option<String>,
+        _thumb: Option<(u32, u32)>,
+    ) -> Result<String, ClientError> {
+        Err(ClientError(
+            "Media is not supported by this backend.".into(),
+        ))
+    }
+
+    /// Save `attachment`'s full-resolution content to `dest_path`
+    /// (checkpoint 07). The destination is picked on the UI side (native
+    /// save dialog must run on the UI thread); the backend fetches bytes
+    /// (media-cache aware, transparent decryption) and writes the file.
+    async fn save_attachment(
+        &self,
+        _convo_id: &str,
+        _attachment: Attachment,
+        _dest_path: String,
+    ) -> Result<(), ClientError> {
+        Err(ClientError(
+            "Media is not supported by this backend.".into(),
+        ))
+    }
 }

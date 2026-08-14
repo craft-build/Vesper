@@ -34,6 +34,7 @@ fn dm(id: &str, name: &str, mxid: &str, status: Presence, last: &str, unread: u3
         last: last.into(),
         unread,
         encrypted: true,
+        avatar: None,
         mxid: Some(mxid.into()),
         status: Some(status),
         topic: None,
@@ -59,6 +60,7 @@ fn room(
         last: last.into(),
         unread,
         encrypted,
+        avatar: None,
         mxid: None,
         status: None,
         topic: Some(topic.into()),
@@ -107,11 +109,7 @@ fn system(time: &str, text: &str) -> Message {
 }
 
 fn with_attachment(mut m: Message, kind: AttachmentKind, name: &str, size: &str) -> Message {
-    m.attachment = Some(Attachment {
-        kind,
-        name: name.into(),
-        size: size.into(),
-    });
+    m.attachment = Some(Attachment::new(kind, name.into(), size.into()));
     m
 }
 
@@ -120,6 +118,7 @@ impl Default for MockClient {
         let me = Me {
             name: "You".into(),
             id: "@you:vesper.chat".into(),
+            avatar: None,
         };
 
         let spaces = vec![
@@ -561,6 +560,7 @@ impl VesperClient for MockClient {
             attachment,
             read_by: Vec::new(),
             send_state: SendState::Sent,
+            avatar: None,
         };
         state
             .messages
