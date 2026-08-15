@@ -75,6 +75,12 @@ pub struct ClientState {
     /// MXC media is content-addressed, so entries never need invalidation;
     /// on-disk persistence across restarts is the SqliteMediaStore's job.
     pub media: Signal<BTreeMap<String, String>, SyncStorage>,
+    /// The active interactive verification session, if any (checkpoint 08).
+    /// Written by the backend's verification driver from the tokio thread,
+    /// read by the verify dialog; `None` when no session is running. One
+    /// slot — one dialog at a time. Same App-scope lifecycle as the maps
+    /// above (see the lifecycle note on this struct).
+    pub verification: Signal<Option<VerificationSession>, SyncStorage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,8 +213,21 @@ pub trait VesperClient {
     fn mark_read(&self, _convo_id: &str) {}
 
     async fn devices(&self) -> Vec<Device>;
-    async fn verify_device(&self, device_id: &str) -> Result<(), ClientError>;
-    async fn verify_user(&self, mxid: &str) -> Result<(), ClientError>;
+
+    /// Start (or replace) an interactive verification session against
+    /// `target` (checkpoint 08). Progress arrives through
+    /// [`ClientState::verification`]; errors surface there as
+    /// [`VerificationState::Failed`] rather than through this return (the
+    /// session outlives the call). Fire-and-forget semantics.
+    fn start_verification(&self, target: VerificationTarget) {
+        let _ = target;
+    }
+
+    /// Act on the active verification session (confirm / mismatch /
+    /// cancel). No-op when none is running.
+    fn verification_action(&self, action: VerificationAction) {
+        let _ = action;
+    }
 
     async fn public_rooms(&self) -> Vec<PublicRoom>;
     async fn public_spaces(&self) -> Vec<PublicSpace>;

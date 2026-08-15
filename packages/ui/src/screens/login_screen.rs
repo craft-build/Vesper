@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 
 use crate::data::{Me, VesperClient};
 use crate::design_system::{Button, ButtonVariant, Input};
-use crate::window_chrome::{WindowControls, use_titlebar};
+use crate::window_chrome::{use_titlebar, WindowControls};
 
 const LOGO: Asset = asset!("/assets/vesper/logo.svg");
 

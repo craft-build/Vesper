@@ -28,7 +28,7 @@ use tokio::{
 use crate::{
     api::{ClientError, ClientState},
     live::{LiveHandles, TypingManager},
-    model::{Attachment, Convo, Me, Reaction, ThreadReply},
+    model::{Attachment, Convo, Me, Reaction, ThreadReply, VerificationSession, VerificationState},
     session, sync,
     timeline::TimelineRegistry,
 };
@@ -161,6 +161,22 @@ pub enum Command {
     /// Mark `room_id` as read up to its latest event (checkpoint 06).
     /// Fire-and-forget: throttled + spawned off the loop.
     MarkRead { room_id: String },
+    /// Start (or replace) an interactive SAS verification session
+    /// (checkpoint 08). Progress publishes into `state.verification`.
+    /// Fire-and-forget: the driver runs in its own task.
+    StartVerification {
+        target: crate::model::VerificationTarget,
+    },
+    /// Act on the active verification session (checkpoint 08).
+    /// Fire-and-forget.
+    VerificationAction {
+        action: crate::model::VerificationAction,
+    },
+    /// List the signed-in user's devices with trust flags (checkpoint 08).
+    /// Answered from a spawned task (network key query).
+    FetchDevices {
+        reply: oneshot::Sender<Result<Vec<crate::model::Device>, ClientError>>,
+    },
 }
 
 /// Post-login send-queue setup (checkpoint 05): make sure the global send
@@ -184,6 +200,46 @@ async fn wire_send_queue(client: &Client) {
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
+    });
+}
+
+/// Post-login E2EE setup (checkpoint 08): cross-signing bootstrap + key
+/// backup/recovery pull, run in its own task so neither the command loop
+/// nor the login reply ever waits on it. Every step logs under one span so
+/// a startup hang is diagnosable from the logs.
+///
+/// UIAA note: `bootstrap_cross_signing_if_needed(None)` can require
+/// interactive auth on accounts that already have cross-signing but lost
+/// their local private keys. That's a warn + targeted error here; a
+/// password-based UIAA flow is a checkpoint-08 stretch goal, checkpoint-11
+/// otherwise.
+fn spawn_crypto_setup(client: &Client) {
+    let client = client.clone();
+    tokio::spawn(async move {
+        let span = tracing::info_span!("e2ee_setup");
+        let _enter = span.enter();
+        // Returns `()`; failures inside the setup task are logged by the SDK.
+        client
+            .encryption()
+            .wait_for_e2ee_initialization_tasks()
+            .await;
+        match client
+            .encryption()
+            .bootstrap_cross_signing_if_needed(None)
+            .await
+        {
+            Ok(()) => tracing::debug!("cross-signing bootstrap ok"),
+            Err(e) => {
+                tracing::warn!("cross-signing bootstrap failed (interactive auth?): {e:?}");
+            }
+        }
+        let status = client.encryption().cross_signing_status().await;
+        tracing::debug!(?status, "cross-signing status");
+        tracing::debug!(
+            backup = ?client.encryption().backups().state(),
+            recovery = ?client.encryption().recovery().state(),
+            "key backup / recovery state"
+        );
     });
 }
 
@@ -224,6 +280,28 @@ async fn restart_sync(
     *live = Some(crate::live::start_live(client, *state));
 }
 
+/// Map the SDK's device collection into the UI model. Crypto devices carry
+/// no last-seen timestamp (that's the `/devices` HTTP endpoint's data), so
+/// `last_seen` is a placeholder until we merge both sources.
+async fn fetch_devices(client: &Client) -> Result<Vec<crate::model::Device>, matrix_sdk::Error> {
+    let own = client
+        .user_id()
+        .ok_or_else(|| crate::verification::unknown_error("not signed in".into()))?;
+    let devices = client.encryption().get_user_devices(own).await?;
+    Ok(devices
+        .devices()
+        .map(|d| crate::model::Device {
+            id: d.device_id().to_string(),
+            name: d
+                .display_name()
+                .map(str::to_string)
+                .unwrap_or_else(|| "Unnamed session".into()),
+            last_seen: "—".into(),
+            verified: d.is_verified(),
+        })
+        .collect())
+}
+
 /// Owns the tokio runtime that matrix-sdk code runs on.
 pub struct ClientRuntime {
     handle: std::thread::JoinHandle<()>,
@@ -254,6 +332,10 @@ impl ClientRuntime {
                     // Checkpoint 04: live timelines keyed by room id, disposed
                     // when the last reader closes (or on logout below).
                     let mut timelines = TimelineRegistry::default();
+                    // Checkpoint 08: the active interactive verification
+                    // session, if any. One at a time; replaced by a new
+                    // `StartVerification` and aborted on logout.
+                    let mut verification: Option<crate::verification::Session> = None;
 
                     while let Some(cmd) = rx.recv().await {
                         match cmd {
@@ -279,6 +361,7 @@ impl ClientRuntime {
                                         wire_send_queue(sdk_client.as_ref().expect("just set"))
                                             .await;
                                         let _ = reply.send(Ok(snapshot));
+                                        spawn_crypto_setup(sdk_client.as_ref().expect("just set"));
                                         restart_sync(
                                             &sdk_client,
                                             &bound,
@@ -299,6 +382,7 @@ impl ClientRuntime {
                                     me = Some(snapshot.clone());
                                     wire_send_queue(sdk_client.as_ref().expect("just set")).await;
                                     let _ = reply.send(Ok(Some(snapshot)));
+                                    spawn_crypto_setup(sdk_client.as_ref().expect("just set"));
                                     restart_sync(
                                         &sdk_client,
                                         &bound,
@@ -340,12 +424,20 @@ impl ClientRuntime {
                                 // shows stale indicators.
                                 live = None;
                                 typing_mgr.abort_all();
+                                // Checkpoint 08: the verification session dies
+                                // with the account; cancel it server-side and
+                                // blank the slot so a later login's dialog
+                                // never resumes stale state.
+                                if let Some(session) = verification.take() {
+                                    session.abort();
+                                }
                                 if let Some((state, _)) = &bound {
                                     let mut state = *state;
                                     state.messages.set(Default::default());
                                     state.threads.set(Default::default());
                                     state.typing.set(Default::default());
                                     state.presence.set(Default::default());
+                                    state.verification.set(None);
                                 }
                                 // Take the client (by value) so the session
                                 // module can drop it — closing sqlite handles —
@@ -520,6 +612,64 @@ impl ClientRuntime {
                                     timelines.mark_read(client, &room_id, *state);
                                 }
                             }
+                            Command::StartVerification { target } => {
+                                let (Some(client), Some((state, _))) = (&sdk_client, &bound) else {
+                                    // Tell the UI instead of a silent no-op
+                                    // (review P3): the dialog would otherwise
+                                    // sit blank forever.
+                                    if let Some((state, _)) = &bound {
+                                        let mut verification = state.verification;
+                                        verification.set(Some(VerificationSession {
+                                            subject: String::new(),
+                                            target: target.clone(),
+                                            state: VerificationState::Failed(
+                                                "Not signed in.".into(),
+                                            ),
+                                            emojis: Vec::new(),
+                                        }));
+                                    }
+                                    continue;
+                                };
+                                // Replace any running session: one dialog.
+                                if let Some(old) = verification.take() {
+                                    old.abort();
+                                }
+                                let subject = match &target {
+                                    crate::model::VerificationTarget::Device(id) => {
+                                        // Best-effort label; the dialog falls
+                                        // back to "the other device".
+                                        id.clone()
+                                    }
+                                    crate::model::VerificationTarget::User(_) => String::new(),
+                                };
+                                // One awaited key query, then the driver task
+                                // owns everything else; the request clone for
+                                // cancel-on-replacement is taken inside.
+                                verification = Some(
+                                    crate::verification::Session::start(
+                                        client, target, subject, *state,
+                                    )
+                                    .await,
+                                );
+                            }
+                            Command::VerificationAction { action } => {
+                                if let Some(session) = verification.as_ref() {
+                                    session.act(action);
+                                }
+                            }
+                            Command::FetchDevices { reply } => {
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                tokio::spawn(async move {
+                                    let result = fetch_devices(&client).await.map_err(|e| {
+                                        tracing::warn!("devices fetch failed: {e:?}");
+                                        ClientError("Could not load sessions.".into())
+                                    });
+                                    let _ = reply.send(result);
+                                });
+                            }
                         }
                     }
                 });
@@ -566,12 +716,19 @@ mod tests {
         runtime.join().expect("runtime thread exits cleanly");
     }
 
+    // MutexGuard held across the login await on purpose: env vars are global
+    // and the session tests touch the same variable.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread")]
     async fn login_with_garbage_homeserver_fails_safely() {
         // No network dependency: an invalid server name fails client build with
         // ClientBuildError::InvalidServerName before any request is attempted.
-        // Keep everything out of the real profile directory.
+        // Keep everything out of the real profile directory. The env lock is
+        // shared with the session tests: env vars are global.
         let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::session::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("VESPER_DATA_DIR", tmp.path());
 
         let (runtime, tx) = ClientRuntime::spawn();
@@ -594,5 +751,7 @@ mod tests {
         );
         drop(tx);
         runtime.join().expect("runtime thread exits cleanly");
+        drop(_guard);
+        std::env::remove_var("VESPER_DATA_DIR");
     }
 }

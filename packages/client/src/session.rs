@@ -10,6 +10,11 @@
 //!   tokens), created with `0600` permissions. Hardening this into the OS
 //!   keyring is a checkpoint-11 task; the file is at least mode-restricted
 //!   from creation, never a chmod after the fact.
+//! - `store-passphrase` — the crypto-store passphrase (checkpoint 08),
+//!   same `0600` treatment. Generated on first login, read back on every
+//!   restore; deleting it (or reusing the store without it) makes the sqlite
+//!   crypto store unopenable, so `cleanup_files` removes it together with
+//!   the session and store dir. Keyring migration is checkpoint-11.
 //!
 //! Credentials never land in logs or user-facing strings: SDK errors are
 //! classified by [`friendly_error`] and reduced to fixed sentences (raw errors
@@ -18,8 +23,8 @@
 use std::path::PathBuf;
 
 use matrix_sdk::{
-    Client, ClientBuildError, HttpError, ThreadingSupport, authentication::matrix::MatrixSession,
-    ruma::api::error::ErrorKind,
+    authentication::matrix::MatrixSession, ruma::api::error::ErrorKind, Client, ClientBuildError,
+    HttpError, ThreadingSupport,
 };
 
 use crate::{api::ClientError, model::Me};
@@ -41,6 +46,50 @@ fn store_dir() -> Result<PathBuf, ClientError> {
 
 fn session_path() -> Result<PathBuf, ClientError> {
     Ok(data_dir()?.join("session.json"))
+}
+
+fn passphrase_path() -> Result<PathBuf, ClientError> {
+    Ok(data_dir()?.join("store-passphrase"))
+}
+
+/// The state database file name matrix-sdk-sqlite uses inside the store dir
+/// (`state_store::DATABASE_NAME`); its presence is the legacy-store signal.
+const STATE_DB_NAME: &str = "matrix-sdk-state.sqlite3";
+
+/// The crypto-store passphrase to open (or create) the sqlite store with.
+///
+/// Fresh installs: 48 random bytes, hex-encoded, persisted `0600` next to
+/// the session file so restore finds the same passphrase.
+///
+/// Legacy migration (checkpoint 07 and earlier stores): if the store dir
+/// already contains a state database but no passphrase file does, the store
+/// was created with `None` and its rows are unencrypted — reopening it with
+/// a passphrase would mint a new store cipher and make every existing row
+/// unreadable. Return `None` with a warn so those installs keep working.
+/// Logging out (which deletes the store) and back in upgrades them to a
+/// passphrase-protected store.
+fn store_passphrase() -> Result<Option<String>, ClientError> {
+    let path = passphrase_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(pass) if !pass.trim().is_empty() => Ok(Some(pass.trim().to_string())),
+        _ => {
+            let store_exists = store_dir().map(|dir| dir.join(STATE_DB_NAME).exists()) == Ok(true);
+            if store_exists {
+                tracing::warn!(
+                    "existing crypto store was created without a passphrase; \
+                     continuing unencrypted (logout + login upgrades it)"
+                );
+                return Ok(None);
+            }
+            let mut bytes = [0u8; 48];
+            getrandom::fill(&mut bytes)
+                .map_err(|e| ClientError(format!("Could not generate a store passphrase: {e}")))?;
+            let pass: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            write_owner_only(&path, pass.as_bytes())
+                .map_err(|e| ClientError(format!("Could not write store passphrase: {e}")))?;
+            Ok(Some(pass))
+        }
+    }
 }
 
 const UNREACHABLE: &str =
@@ -111,9 +160,13 @@ async fn build_client(homeserver: &str) -> Result<Client, ClientError> {
     std::fs::create_dir_all(&store_dir)
         .map_err(|e| ClientError(format!("Could not create data directory: {e}")))?;
 
+    // Checkpoint 08: the sqlite store (state + crypto) is passphrase-locked
+    // when created fresh; see [`store_passphrase`] for the legacy branch.
+    let passphrase = store_passphrase()?;
+
     Client::builder()
         .server_name_or_homeserver_url(homeserver)
-        .sqlite_store(&store_dir, None)
+        .sqlite_store(&store_dir, passphrase.as_deref())
         .handle_refresh_tokens()
         // Enable thread support so the event cache tracks thread roots and
         // populates `MsgLikeContent::thread_summary` (num_replies) on them as
@@ -269,12 +322,19 @@ pub async fn connect_restore() -> Result<Option<(Client, Me)>, ClientError> {
 /// the sqlite store, which holds crypto state for this device). Takes the
 /// client by value so it is *dropped* — closing its sqlite handles — before
 /// the store dir is deleted (open handles would lock the files on Windows).
+///
+/// The remote logout is bounded (30s) so a dead homeserver can't stall the
+/// caller — the runtime's sequential command loop awaits this (review P2:
+/// every queued command would otherwise wait out the HTTP timeout).
 pub async fn logout(client: Option<Client>) -> Result<(), ClientError> {
     if let Some(client) = client {
         // Server-side logout is best-effort: a dead homeserver must not strand
         // the local account. Local cleanup proceeds either way.
-        if let Err(e) = client.matrix_auth().logout().await {
-            tracing::warn!("remote logout failed (continuing local cleanup): {e}");
+        let logout_fut = async { client.matrix_auth().logout().await };
+        match tokio::time::timeout(std::time::Duration::from_secs(30), logout_fut).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!("remote logout failed (continuing local cleanup): {e}"),
+            Err(_) => tracing::warn!("remote logout timed out (continuing local cleanup)"),
         }
         drop(client);
     }
@@ -283,7 +343,8 @@ pub async fn logout(client: Option<Client>) -> Result<(), ClientError> {
 }
 
 fn cleanup_files() {
-    for result in [session_path(), store_dir()] {
+    let mut paths = vec![session_path(), passphrase_path(), store_dir()];
+    for result in paths.drain(..) {
         let Ok(path) = result else { continue };
         if path.is_dir() {
             let _ = std::fs::remove_dir_all(&path);
@@ -293,8 +354,8 @@ fn cleanup_files() {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, feature = "matrix"))]
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -302,6 +363,10 @@ mod tests {
         if std::env::var_os("HOME").is_none() && cfg!(unix) {
             return; // directories needs HOME on unix; holds on anything real.
         }
+        // Take the env lock: sibling tests set/remove `VESPER_DATA_DIR` and
+        // this test reads the data dir resolution live.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("VESPER_DATA_DIR");
         let base = data_dir().expect("data dir");
         assert!(session_path().unwrap().starts_with(&base));
         assert!(store_dir().unwrap().starts_with(&base));
@@ -328,5 +393,59 @@ mod tests {
         ))));
         assert!(!is_auth_failure(Some(&ErrorKind::Unknown)));
         assert!(!is_auth_failure(None));
+    }
+
+    // `store_passphrase` reads the data dir from the environment at call
+    // time; the lock is shared with the runtime tests so any two tests
+    // touching `VESPER_DATA_DIR` never race (env vars are global).
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_data_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("VESPER_DATA_DIR", dir.path());
+        let out = f(dir.path());
+        std::env::remove_var("VESPER_DATA_DIR");
+        out
+    }
+
+    #[test]
+    fn passphrase_generated_once_then_stable() {
+        with_data_dir(|_| {
+            let first = store_passphrase().expect("generate");
+            assert!(first.is_some(), "fresh install gets a passphrase");
+            let second = store_passphrase().expect("read back");
+            assert_eq!(first, second, "restore must reuse the stored passphrase");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passphrase_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        with_data_dir(|_| {
+            store_passphrase().expect("generate");
+            let mode = passphrase_path()
+                .expect("path")
+                .metadata()
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+        });
+    }
+
+    #[test]
+    fn legacy_store_without_passphrase_stays_unlocked() {
+        with_data_dir(|dir| {
+            // A pre-checkpoint-08 store exists but no passphrase file: the
+            // store must be reopened the way it was created (no passphrase),
+            // and no passphrase file may be written next to it.
+            std::fs::create_dir_all(dir.join("matrix-store")).expect("store dir");
+            std::fs::write(dir.join("matrix-store/matrix-sdk-state.sqlite3"), b"").expect("db");
+            assert_eq!(store_passphrase().expect("legacy branch"), None);
+            assert!(!dir.join("store-passphrase").exists());
+        });
     }
 }

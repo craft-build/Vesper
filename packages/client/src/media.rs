@@ -13,9 +13,8 @@
 //! automatically — cache hits survive restarts, and MXC URIs are
 //! content-addressed so entries never go stale.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use matrix_sdk::{
-    Client, Room,
     attachment::{
         AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
         BaseVideoInfo, Thumbnail,
@@ -23,12 +22,13 @@ use matrix_sdk::{
     media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
     room::reply::{EnforceThread, Reply},
     ruma::{
-        EventId, OwnedMxcUri, UInt,
         events::room::{
-            EncryptedFile, MediaSource,
             message::{AddMentions, TextMessageEventContent},
+            EncryptedFile, MediaSource,
         },
+        EventId, OwnedMxcUri, UInt,
     },
+    Client, Room,
 };
 
 use crate::{

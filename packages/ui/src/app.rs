@@ -52,6 +52,10 @@ pub fn App() -> Element {
     let focused = use_signal_sync(|| true);
     let active_room = use_signal_sync(|| None::<String>);
     let media = use_signal_sync(std::collections::BTreeMap::<String, String>::new);
+    // Active verification session (checkpoint 08): written by the backend's
+    // verification driver task, read by the verify dialog. One slot, App-scope
+    // lifecycle like the maps above.
+    let verification = use_signal_sync(|| None::<data::VerificationSession>);
     let sync_state = ClientState {
         convos,
         connecting,
@@ -62,6 +66,7 @@ pub fn App() -> Element {
         focused,
         active_room,
         media,
+        verification,
     };
     use_context_provider(|| sync_state);
     use_effect({

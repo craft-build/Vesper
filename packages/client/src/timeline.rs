@@ -22,22 +22,22 @@ use std::{
 use dioxus_signals::{ReadableExt, WritableExt};
 use futures::StreamExt;
 use matrix_sdk::{
-    Client, RoomState,
     ruma::{
-        EventId, OwnedEventId, OwnedTransactionId, RoomId,
         events::{
             relation::Thread,
             room::message::{
                 Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
             },
         },
+        EventId, OwnedEventId, OwnedTransactionId, RoomId,
     },
     send_queue::SendHandle,
+    Client, RoomState,
 };
 use matrix_sdk_ui::timeline::{
-    EventSendState, EventTimelineItem, MembershipChange, MsgLikeContent, MsgLikeKind, Timeline,
-    TimelineBuilder, TimelineDetails, TimelineEventItemId, TimelineFocus, TimelineItem,
-    TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
+    EncryptedMessage, EventSendState, EventTimelineItem, MembershipChange, MsgLikeContent,
+    MsgLikeKind, Timeline, TimelineBuilder, TimelineDetails, TimelineEventItemId, TimelineFocus,
+    TimelineItem, TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
 };
 
 use crate::{
@@ -730,7 +730,7 @@ fn spawn_typing_task(
 ) -> tokio::task::JoinHandle<()> {
     let (_guard, mut rx) = room.subscribe_to_typing_notifications();
     tokio::spawn(async move {
-        use tokio::time::{Duration, timeout};
+        use tokio::time::{timeout, Duration};
         // Keep the guard alive for the task's lifetime; dropping it
         // unregisters the typing handler.
         let _guard = _guard;
@@ -1041,9 +1041,13 @@ fn map_msglike(
             )
         }
         MsgLikeKind::Redacted => ("message removed".into(), true),
-        // Encryption failure details (session id etc.) are checkpoint 08
-        // debugging material, not placeholder-row text.
-        MsgLikeKind::UnableToDecrypt(_) => ("🔒 unable to decrypt".into(), true),
+        // Placeholder row unchanged; the reason class lands in debug logs for
+        // support (checkpoint 08): megolm UTDs name the missing session,
+        // olm/unknown name the algorithm. No crypto jargon in the UI.
+        MsgLikeKind::UnableToDecrypt(encrypted) => {
+            log_utd_reason(encrypted);
+            ("🔒 unable to decrypt".into(), true)
+        }
         MsgLikeKind::Sticker(s) => (format!("sticker: {}", s.content().body), false),
         MsgLikeKind::Poll(_) => ("[poll — open in another client]".into(), true),
         _ => ("[unsupported message type]".into(), true),
@@ -1110,6 +1114,26 @@ fn thread_reply_row(item: &TimelineItem) -> Option<ThreadReply> {
         mine: event.is_own(),
         text,
     })
+}
+
+/// Debug-log why an encrypted event couldn't be decrypted: megolm UTDs
+/// name the missing session id (the key to look for in gossip/backup logs);
+/// olm events name the algorithm; `Unknown` means an unrecognized scheme.
+fn log_utd_reason(encrypted: &EncryptedMessage) {
+    match encrypted {
+        EncryptedMessage::MegolmV1AesSha2 { session_id, .. } => {
+            tracing::debug!(
+                session_id,
+                "UTD: megolm session missing or not yet received"
+            );
+        }
+        EncryptedMessage::OlmV1Curve25519AesSha2 { .. } => {
+            tracing::debug!("UTD: olm event (not a room message)");
+        }
+        EncryptedMessage::Unknown => {
+            tracing::debug!("UTD: unknown encryption algorithm");
+        }
+    }
 }
 
 fn aggregate_reactions(msglike: &MsgLikeContent, own_id: &str) -> Vec<Reaction> {

@@ -203,6 +203,70 @@ pub struct Device {
     pub verified: bool,
 }
 
+/// Who an interactive verification session runs against (checkpoint 08).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationTarget {
+    /// One of the signed-in user's other sessions, by device id.
+    Device(String),
+    /// A conversation counterpart, by MXID.
+    User(String),
+}
+
+/// One emoji of a SAS short-auth string: `("🐱", "Cat")`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SasEmoji {
+    pub symbol: String,
+    pub description: String,
+}
+
+/// Lifecycle of an interactive verification session, mirrored from the
+/// backend's SAS state machine into [`ClientState::verification`] so the
+/// dialog can render it live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationState {
+    /// Outgoing request sent, waiting for the other side to accept.
+    Requested,
+    /// Both sides accepted; short-auth string not yet available.
+    Ready,
+    /// Emojis are available for the user to compare.
+    EmojisShown,
+    /// We confirmed; waiting for the other side to confirm too.
+    Confirmed,
+    /// Both sides confirmed — verification complete.
+    Done,
+    /// Cancelled by either side (includes mismatch).
+    Cancelled,
+    /// The session failed to start (no SAS support, network error…).
+    Failed(String),
+}
+
+/// The active verification session published through
+/// [`ClientState::verification`]. One at a time — the UI shows one dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationSession {
+    /// Display label for the dialog ("the other device" fallback when the
+    /// UI passes none).
+    pub subject: String,
+    /// Who this session verifies — lets surfaces (profile panel, device
+    /// rows) correlate a `Done` with *their* target instead of any session
+    /// completing (review P2).
+    pub target: VerificationTarget,
+    pub state: VerificationState,
+    /// The 7-emoji short-auth string; empty until `EmojisShown`.
+    pub emojis: Vec<SasEmoji>,
+}
+
+/// User decisions driving an active verification session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationAction {
+    /// "They match" — confirm.
+    Confirm,
+    /// "They don't match" — mismatch + cancel.
+    Mismatch,
+    /// Dialog closed — cancel.
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicRoom {
     pub id: String,

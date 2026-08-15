@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use dioxus::prelude::WritableExt;
+use dioxus::prelude::{ReadableExt, WritableExt};
 
 use crate::data::*;
 
@@ -24,7 +24,25 @@ struct MockState {
 
 pub struct MockClient {
     state: RefCell<MockState>,
+    /// Live UI state handed over by `bind_state` (checkpoint 08): the fake
+    /// verification session publishes into its `verification` signal.
+    bound: RefCell<Option<ClientState>>,
+    /// Device id the active fake session is verifying, so `Confirm` can
+    /// flip its verified flag in the mock store.
+    target_device: RefCell<Option<String>>,
 }
+
+/// The mock's scripted SAS short-auth string: same 7 emojis every time,
+/// so UI iteration is deterministic.
+const MOCK_EMOJIS: [(&str, &str); 7] = [
+    ("🐱", "Cat"),
+    ("🚀", "Rocket"),
+    ("🎩", "Top hat"),
+    ("🔑", "Key"),
+    ("🍕", "Pizza"),
+    ("🌋", "Volcano"),
+    ("🌊", "Wave"),
+];
 
 fn dm(id: &str, name: &str, mxid: &str, status: Presence, last: &str, unread: u32) -> Convo {
     Convo {
@@ -461,6 +479,8 @@ impl Default for MockClient {
                 public_spaces,
                 next_id: 1,
             }),
+            bound: RefCell::new(None),
+            target_device: RefCell::new(None),
         }
     }
 }
@@ -494,6 +514,7 @@ impl VesperClient for MockClient {
         // "connecting". Mutations (send, react) touch messages, not convos.
         state.convos.set(self.state.borrow().convos.clone());
         state.connecting.set(false);
+        *self.bound.borrow_mut() = Some(state);
     }
 
     async fn spaces(&self) -> Vec<Space> {
@@ -641,22 +662,67 @@ impl VesperClient for MockClient {
         self.state.borrow().devices.clone()
     }
 
-    async fn verify_device(&self, device_id: &str) -> Result<(), ClientError> {
-        let mut state = self.state.borrow_mut();
-        match state.devices.iter_mut().find(|d| d.id == device_id) {
-            Some(device) => {
-                device.verified = true;
-                Ok(())
-            }
-            None => Err(ClientError(format!("unknown device {device_id}"))),
+    // Checkpoint 08: scripted happy-path session. `EmojisShown` immediately
+    // (deterministic 7 emojis), confirm → `Done` and the target device
+    // flips verified in the mock store, mismatch/cancel → `Cancelled`.
+    fn start_verification(&self, target: VerificationTarget) {
+        let Some(state) = *self.bound.borrow() else {
+            return;
+        };
+        let subject = match &target {
+            VerificationTarget::Device(id) => self
+                .state
+                .borrow()
+                .devices
+                .iter()
+                .find(|d| &d.id == id)
+                .map(|d| d.name.clone())
+                .unwrap_or_default(),
+            VerificationTarget::User(_) => String::new(),
+        };
+        if let VerificationTarget::Device(id) = &target {
+            *self.target_device.borrow_mut() = Some(id.clone());
         }
+        let mut verification = state.verification;
+        verification.set(Some(VerificationSession {
+            subject,
+            target,
+            state: VerificationState::EmojisShown,
+            emojis: MOCK_EMOJIS
+                .iter()
+                .map(|(symbol, description)| SasEmoji {
+                    symbol: (*symbol).into(),
+                    description: (*description).into(),
+                })
+                .collect(),
+        }));
     }
 
-    async fn verify_user(&self, _mxid: &str) -> Result<(), ClientError> {
-        // Verification state for people (as opposed to devices) is UI-local in the
-        // prototype (VerifyDialog's confirmation just flips ProfilePanel's own signal) —
-        // there's nothing to persist server-side in the mock either.
-        Ok(())
+    fn verification_action(&self, action: VerificationAction) {
+        let Some(state) = *self.bound.borrow() else {
+            return;
+        };
+        let Some(mut session) = state.verification.read().clone() else {
+            return;
+        };
+        match action {
+            VerificationAction::Confirm => {
+                session.state = VerificationState::Done;
+                if let Some(id) = self.target_device.borrow().clone() {
+                    let mut store = self.state.borrow_mut();
+                    if let Some(device) = store.devices.iter_mut().find(|d| d.id == id) {
+                        device.verified = true;
+                    }
+                }
+            }
+            VerificationAction::Mismatch | VerificationAction::Cancel => {
+                session.state = VerificationState::Cancelled;
+            }
+        }
+        let mut verification = state.verification;
+        if verification.read().clone() != Some(session.clone()) {
+            verification.set(Some(session));
+        }
     }
 
     async fn public_rooms(&self) -> Vec<PublicRoom> {

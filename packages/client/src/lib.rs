@@ -22,6 +22,8 @@ mod session;
 pub mod sync;
 #[cfg(feature = "matrix")]
 pub mod timeline;
+#[cfg(feature = "matrix")]
+pub mod verification;
 
 #[cfg(feature = "matrix")]
 mod matrix_impl {
@@ -262,9 +264,6 @@ mod matrix_impl {
             .await
         }
 
-        async fn devices(&self) -> Vec<Device> {
-            Self::empty_vec("devices")
-        }
         fn open_thread(&self, convo_id: &str, message_id: &str) {
             let _ = self.tx.send(Command::OpenThread {
                 room_id: convo_id.to_string(),
@@ -288,11 +287,23 @@ mod matrix_impl {
             });
         }
 
-        async fn verify_device(&self, _device_id: &str) -> Result<(), ClientError> {
-            Err(Self::unimplemented("verify_device"))
+        // Checkpoint 08: interactive verification session (see
+        // `verification::Session`); state flows back through
+        // `ClientState::verification`.
+        fn start_verification(&self, target: VerificationTarget) {
+            let _ = self.tx.send(Command::StartVerification { target });
         }
-        async fn verify_user(&self, _mxid: &str) -> Result<(), ClientError> {
-            Err(Self::unimplemented("verify_user"))
+        fn verification_action(&self, action: VerificationAction) {
+            let _ = self.tx.send(Command::VerificationAction { action });
+        }
+
+        async fn devices(&self) -> Vec<Device> {
+            self.ask(|reply| Command::FetchDevices { reply })
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("devices: {}", e.0);
+                    Vec::new()
+                })
         }
 
         async fn public_rooms(&self) -> Vec<PublicRoom> {

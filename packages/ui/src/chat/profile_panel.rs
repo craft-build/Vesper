@@ -3,7 +3,10 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use super::verify_dialog::VerifyDialog;
-use crate::data::{ClientState, Convo, Me, Presence, VesperClient};
+use crate::data::{
+    ClientState, Convo, Me, Presence, VerificationAction, VerificationState, VerificationTarget,
+    VesperClient,
+};
 use crate::design_system::{Avatar, Button, ButtonVariant, StatusDot, Tag, TagTone};
 use crate::icons::{Icon, IconName};
 
@@ -85,6 +88,23 @@ pub fn ProfilePanel(
     let mut verified = use_signal(|| false);
 
     let mxid = target.mxid.clone().unwrap_or_default();
+    // Clone for the effect closure; `mxid` itself stays owned by the
+    // component body for the panel markup below.
+    let effect_mxid = mxid.clone();
+
+    // Verification state follows the backend session: only a *user-targeted*
+    // session for this contact's MXID marks them verified here — a device
+    // verification from Settings must not (review P2). Guarded same-value
+    // write (checkpoint-06 effect-loop lesson).
+    use_effect(move || {
+        let done = sync.verification.read().as_ref().is_some_and(|s| {
+            matches!(s.state, VerificationState::Done)
+                && s.target == VerificationTarget::User(effect_mxid.clone())
+        });
+        if done && !verified() {
+            verified.set(true);
+        }
+    });
 
     // Live presence (checkpoint 06): prefer the backend's presence map for
     // the contact's MXID, falling back to the snapshot `target.status`, then
@@ -151,7 +171,18 @@ pub fn ProfilePanel(
                                 div { style: "font-size:12px;color:var(--text-tertiary);", if verified() { "You have verified this user." } else { "Verify to confirm their identity." } }
                             }
                             if !verified() {
-                                Button { variant: ButtonVariant::Secondary, size: crate::design_system::ButtonSize::Sm, onclick: move |_| verify_open.set(true), "Verify" }
+                                Button { variant: ButtonVariant::Secondary, size: crate::design_system::ButtonSize::Sm, onclick: {
+                                    let client = client.clone();
+                                    let mxid = mxid.clone();
+                                    move |_| {
+                                        verify_open.set(true);
+                                        let client = client.clone();
+                                        let mxid = mxid.clone();
+                                        spawn(async move {
+                                            client.start_verification(VerificationTarget::User(mxid));
+                                        });
+                                    }
+                                }, "Verify" }
                             }
                         }
                     }
@@ -159,16 +190,25 @@ pub fn ProfilePanel(
             }
             VerifyDialog {
                 open: verify_open(),
-                subject: target.name.clone(),
-                on_close: move |_| verify_open.set(false),
-                on_confirm: move |_| {
-                    verified.set(true);
-                    verify_open.set(false);
+                on_close: {
                     let client = client.clone();
-                    let mxid = mxid.clone();
-                    spawn(async move {
-                        let _ = client.verify_user(&mxid).await;
-                    });
+                    move |_| {
+                        verify_open.set(false);
+                        // Manual close mid-session cancels it server-side.
+                        let client = client.clone();
+                        spawn(async move {
+                            client.verification_action(VerificationAction::Cancel);
+                        });
+                    }
+                },
+                on_action: {
+                    let client = client.clone();
+                    move |action: VerificationAction| {
+                        let client = client.clone();
+                        spawn(async move {
+                            client.verification_action(action);
+                        });
+                    }
                 },
             }
         }

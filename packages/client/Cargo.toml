@@ -23,6 +23,7 @@ matrix = [
     "dep:infer",
     "dep:base64",
     "dep:mime",
+    "dep:getrandom",
 ]
 
 [dependencies]
@@ -46,6 +47,9 @@ futures = { version = "0.3", optional = true }
 # off `wasm32` in the notification task itself — `notify-rust` has no web
 # backend.
 notify-rust = { version = "4", optional = true }
+# Crypto-store passphrase generation (checkpoint 08); matches the SDK's
+# getrandom tree.
+getrandom = { version = "0.3", optional = true }
 # Checkpoint 07 media: decode + downscale composer-picked images for
 # thumbnails; sniff picked-file types; encode resolved media as data URIs.
 # Minimal codec set keeps build time down; GIF stays server-thumbnailable

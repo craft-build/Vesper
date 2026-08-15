@@ -3,7 +3,7 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use crate::chat::VerifyDialog;
-use crate::data::{Device, Me, VesperClient};
+use crate::data::{ClientState, Device, Me, VerificationAction, VerificationTarget, VesperClient};
 use crate::design_system::{
     Avatar, Button, ButtonSize, ButtonVariant, SelectOption, SidebarNav, SidebarNavItem, Switch,
 };
@@ -58,6 +58,7 @@ pub fn SettingsScreen(
     let mut typing_indicators = use_signal(|| true);
     let mut tab = use_signal(|| SettingsTab::General);
     let mut verify_id = use_signal(|| Option::<String>::None);
+    let sync = use_context::<ClientState>();
 
     let me = {
         let client = client.clone();
@@ -68,9 +69,17 @@ pub fn SettingsScreen(
     };
     let devices_resource = {
         let client = client.clone();
+        // Reading the verification signal inside the future re-subscribes the
+        // resource: when a session completes (Done/Cancelled) the device list
+        // refetches and the just-verified badge appears without a manual
+        // refresh.
         use_resource(move || {
             let client = client.clone();
-            async move { client.devices().await }
+            let session_state = sync.verification.read().as_ref().map(|s| s.state.clone());
+            async move {
+                let _ = &session_state;
+                client.devices().await
+            }
         })
     };
     let mut devices = use_signal(Vec::<Device>::new);
@@ -80,14 +89,18 @@ pub fn SettingsScreen(
         }
     });
 
-    let verify_subject = verify_id()
-        .and_then(|id| {
-            devices()
-                .iter()
-                .find(|d| d.id == id)
-                .map(|d| d.name.clone())
-        })
-        .unwrap_or_default();
+    // Verify button starts a backend session; the dialog renders whatever
+    // the backend publishes into `sync.verification` (mock: instant emojis;
+    // matrix: Requested → EmojisShown as the other side accepts).
+    let start_verify = {
+        let client = client.clone();
+        move |id: String| {
+            let client = client.clone();
+            spawn(async move {
+                client.start_verification(VerificationTarget::Device(id));
+            });
+        }
+    };
 
     // Clone for the logout handler without moving `client` (still used below).
     let logout_client = client.clone();
@@ -185,6 +198,7 @@ pub fn SettingsScreen(
                             for d in devices().iter() {
                                 {
                                     let id = d.id.clone();
+                                    let start_verify = start_verify.clone();
                                     rsx! {
                                         div { key: "{d.id}", style: "display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-md);",
                                             Icon {
@@ -197,7 +211,10 @@ pub fn SettingsScreen(
                                                 div { style: "font-size:12px;color:var(--text-tertiary);", "{d.last_seen}" }
                                             }
                                             if !d.verified {
-                                                Button { variant: ButtonVariant::Secondary, size: ButtonSize::Sm, onclick: move |_| verify_id.set(Some(id.clone())), "Verify" }
+                                                Button { variant: ButtonVariant::Secondary, size: ButtonSize::Sm, onclick: move |_| {
+                                                    verify_id.set(Some(id.clone()));
+                                                    start_verify(id.clone());
+                                                }, "Verify" }
                                             }
                                         }
                                     }
@@ -209,21 +226,27 @@ pub fn SettingsScreen(
             }
             VerifyDialog {
                 open: verify_id().is_some(),
-                subject: verify_subject,
-                on_close: move |_| verify_id.set(None),
-                on_confirm: move |_| {
-                    if let Some(id) = verify_id() {
-                        devices.write().iter_mut().for_each(|d| {
-                            if d.id == id {
-                                d.verified = true;
-                            }
-                        });
+                on_close: {
+                    let client = client.clone();
+                    move |_| {
+                        verify_id.set(None);
+                        // Manual close mid-session cancels it server-side; on
+                        // terminal states (Done/Cancelled) this is a no-op the
+                        // backend ignores.
                         let client = client.clone();
                         spawn(async move {
-                            let _ = client.verify_device(&id).await;
+                            client.verification_action(VerificationAction::Cancel);
                         });
                     }
-                    verify_id.set(None);
+                },
+                on_action: {
+                    let client = client.clone();
+                    move |action: VerificationAction| {
+                        let client = client.clone();
+                        spawn(async move {
+                            client.verification_action(action);
+                        });
+                    }
                 },
             }
         }

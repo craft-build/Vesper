@@ -25,7 +25,7 @@ use futures::StreamExt;
 use matrix_sdk::{Client, RoomState};
 use matrix_sdk_ui::{
     room_list_service::{
-        RoomListItem, RoomListLoadingState, RoomListService, filters::new_filter_all,
+        filters::new_filter_all, RoomListItem, RoomListLoadingState, RoomListService,
     },
     sync_service::{State as SyncState, SyncService},
 };

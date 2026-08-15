@@ -933,6 +933,7 @@ dependencies = [
  "directories",
  "eyeball-im",
  "futures",
+ "getrandom 0.3.4",
  "image",
  "infer",
  "matrix-sdk",
