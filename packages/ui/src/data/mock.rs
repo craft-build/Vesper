@@ -22,6 +22,10 @@ struct MockState {
     next_id: u64,
 }
 
+/// Mock directory page size: small on purpose so search + "load more" can be
+/// exercised offline without a wall of fixtures.
+const MOCK_PAGE_SIZE: usize = 4;
+
 pub struct MockClient {
     state: RefCell<MockState>,
     /// Live UI state handed over by `bind_state` (checkpoint 08): the fake
@@ -139,14 +143,22 @@ impl Default for MockClient {
             avatar: None,
         };
 
+        // Children mirror the seeded convos' `space` fields so the drawer's
+        // grouping has data to chew on offline.
         let spaces = vec![
             Space {
                 id: "vesper-team".into(),
                 name: "Vesper Team".into(),
+                avatar: None,
+                members: Some(7),
+                children: vec!["general".into(), "design".into(), "ops".into()],
             },
             Space {
                 id: "matrix-hq".into(),
                 name: "Matrix HQ".into(),
+                avatar: None,
+                members: Some(523),
+                children: vec!["matrix-hq".into(), "random".into()],
             },
         ];
 
@@ -433,6 +445,10 @@ impl Default for MockClient {
             },
         ];
 
+        // Directory fixtures (checkpoint 09): enough rows to overflow
+        // [`MOCK_PAGE_SIZE`] so "load more" has something to load. Joining
+        // the "forbidden" room exercises the modal's inline error state
+        // offline.
         let public_rooms = vec![
             PublicRoom {
                 id: "fosdem".into(),
@@ -452,18 +468,68 @@ impl Default for MockClient {
                 members: 610,
                 topic: "Client development discussion".into(),
             },
+            PublicRoom {
+                id: "rust".into(),
+                name: "rust:matrix.org".into(),
+                members: 3100,
+                topic: "The Rust programming language".into(),
+            },
+            PublicRoom {
+                id: "thisweekinmatrix".into(),
+                name: "twim:matrix.org".into(),
+                members: 480,
+                topic: "This Week in Matrix".into(),
+            },
+            PublicRoom {
+                id: "matrix-spec".into(),
+                name: "matrix-spec:matrix.org".into(),
+                members: 260,
+                topic: "Spec authoring and process".into(),
+            },
+            PublicRoom {
+                id: "triage".into(),
+                name: "traversal:matrix.org".into(),
+                members: 120,
+                topic: "Wednesday triage party".into(),
+            },
+            PublicRoom {
+                id: "forbidden-room".into(),
+                name: "invite-only:example.org".into(),
+                members: 42,
+                topic: "Joining this one fails (mock error fixture)".into(),
+            },
         ];
 
         let public_spaces = vec![
             PublicSpace {
                 id: "foss-collective".into(),
                 name: "FOSS Collective".into(),
-                rooms: 24,
+                members: 2412,
+                topic: "Free software communities under one roof".into(),
             },
             PublicSpace {
                 id: "indie-devs".into(),
                 name: "Indie Devs".into(),
-                rooms: 11,
+                members: 611,
+                topic: "Solo gamedev and appdev chatter".into(),
+            },
+            PublicSpace {
+                id: "matrix-live".into(),
+                name: "Matrix Live".into(),
+                members: 890,
+                topic: "Talks, streams, and office hours".into(),
+            },
+            PublicSpace {
+                id: "privacy-tools".into(),
+                name: "Privacy Tools".into(),
+                members: 137,
+                topic: "E2EE everything".into(),
+            },
+            PublicSpace {
+                id: "web-dev-hub".into(),
+                name: "Web Dev Hub".into(),
+                members: 533,
+                topic: "Frontend, backend, and the misery between".into(),
             },
         ];
 
@@ -482,6 +548,20 @@ impl Default for MockClient {
             bound: RefCell::new(None),
             target_device: RefCell::new(None),
         }
+    }
+}
+
+impl MockClient {
+    /// The mock's stand-in for the backend's sync stream (checkpoint 09):
+    /// after join/leave mutate the store, republish both lists into the
+    /// bound signals so the nav drawer re-renders. No-ops before
+    /// `bind_state`.
+    fn publish_lists(&self) {
+        let Some(mut state) = *self.bound.borrow() else {
+            return;
+        };
+        state.convos.set(self.state.borrow().convos.clone());
+        state.spaces.set(self.state.borrow().spaces.clone());
     }
 }
 
@@ -511,8 +591,10 @@ impl VesperClient for MockClient {
 
     fn bind_state(&self, mut state: ClientState) {
         // Mock has no live sync: seed the list once and never show
-        // "connecting". Mutations (send, react) touch messages, not convos.
+        // "connecting". Mutations (send, react, join/leave) touch messages
+        // and the convo/space lists, republished below.
         state.convos.set(self.state.borrow().convos.clone());
+        state.spaces.set(self.state.borrow().spaces.clone());
         state.connecting.set(false);
         *self.bound.borrow_mut() = Some(state);
     }
@@ -725,15 +807,143 @@ impl VesperClient for MockClient {
         }
     }
 
-    async fn public_rooms(&self) -> Vec<PublicRoom> {
-        self.state.borrow().public_rooms.clone()
+    // Checkpoint 09: query-aware, paginated directory over the fixtures.
+    // The batch token is the next offset into the query-filtered list
+    // (clamped — a stale token from a superseded query yields an empty page,
+    // never a panic).
+    async fn public_rooms(
+        &self,
+        query: String,
+        batch_token: Option<String>,
+    ) -> Result<PublicRoomPage, ClientError> {
+        let state = self.state.borrow();
+        let filtered = filter_directory(&state.public_rooms, &query, |r| (&r.name, &r.topic));
+        let start = batch_token
+            .and_then(|t| t.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(filtered.len());
+        let end = (start + MOCK_PAGE_SIZE).min(filtered.len());
+        Ok(PublicRoomPage {
+            rooms: filtered[start..end].to_vec(),
+            next: (end < filtered.len()).then(|| end.to_string()),
+        })
     }
 
-    async fn public_spaces(&self) -> Vec<PublicSpace> {
-        self.state.borrow().public_spaces.clone()
+    async fn public_spaces(
+        &self,
+        query: String,
+        batch_token: Option<String>,
+    ) -> Result<PublicSpacePage, ClientError> {
+        let state = self.state.borrow();
+        let filtered = filter_directory(&state.public_spaces, &query, |s| (&s.name, &s.topic));
+        let start = batch_token
+            .and_then(|t| t.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(filtered.len());
+        let end = (start + MOCK_PAGE_SIZE).min(filtered.len());
+        Ok(PublicSpacePage {
+            spaces: filtered[start..end].to_vec(),
+            next: (end < filtered.len()).then(|| end.to_string()),
+        })
     }
 
-    async fn join_room(&self, _room_id: &str) -> Result<(), ClientError> {
+    // Joining (checkpoint 09): rooms join as ungrouped convos with a
+    // system-style last line; spaces join into the spaces list. The
+    // "forbidden" fixture exercises the modal's inline error state.
+    async fn join_room(&self, room_id_or_alias: &str) -> Result<(), ClientError> {
+        if room_id_or_alias.contains("forbidden") {
+            return Err(ClientError(
+                "You can't join that room (invite-only?).".into(),
+            ));
+        }
+        let mut state = self.state.borrow_mut();
+        if let Some(space) = state
+            .public_spaces
+            .iter()
+            .find(|s| s.id == room_id_or_alias)
+            .cloned()
+        {
+            if state.spaces.iter().any(|s| s.id == space.id) {
+                return Ok(());
+            }
+            state.spaces.push(Space {
+                id: space.id,
+                name: space.name,
+                avatar: None,
+                members: Some(space.members),
+                children: Vec::new(),
+            });
+            drop(state);
+            self.publish_lists();
+            return Ok(());
+        }
+        if state.convos.iter().any(|c| c.id == room_id_or_alias) {
+            return Ok(());
+        }
+        let entry = state.public_rooms.iter().find(|r| r.id == room_id_or_alias);
+        let (name, members, topic) = match entry {
+            Some(r) => (r.name.clone(), Some(r.members), Some(r.topic.clone())),
+            None => (room_id_or_alias.to_string(), None, None),
+        };
+        let convo = Convo {
+            id: room_id_or_alias.to_string(),
+            kind: ConvoKind::Room,
+            name,
+            last: "You joined this room".into(),
+            unread: 0,
+            encrypted: false,
+            avatar: None,
+            mxid: None,
+            status: None,
+            topic,
+            // Ungrouped until the (mock-absent) space lists it.
+            space: None,
+            members,
+        };
+        state.convos.push(convo);
+        drop(state);
+        self.publish_lists();
         Ok(())
     }
+
+    async fn leave_room(&self, room_id: &str) -> Result<(), ClientError> {
+        let mut state = self.state.borrow_mut();
+        let had_room = state.convos.iter().any(|c| c.id == room_id);
+        let had_space = state.spaces.iter().any(|s| s.id == room_id);
+        if !had_room && !had_space {
+            return Err(ClientError("That room isn't in your list anymore.".into()));
+        }
+        state.convos.retain(|c| c.id != room_id);
+        state.spaces.retain(|s| s.id != room_id);
+        // A space's children list can keep ids we just left — rooms are only
+        // grouped when they're in the convo list, so no extra cleanup needed.
+        drop(state);
+        self.publish_lists();
+        Ok(())
+    }
+}
+
+/// Mock search: case-insensitive substring over name and topic, mirroring
+/// the server-side `generic_search_term` contract well enough for offline
+/// UI iteration.
+fn filter_directory<T>(
+    items: &[T],
+    query: &str,
+    fields: impl Fn(&T) -> (&String, &String),
+) -> Vec<T>
+where
+    T: Clone,
+{
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return items.to_vec();
+    }
+    items
+        .iter()
+        .filter(|item| {
+            let (name, topic) = fields(item);
+            name.to_lowercase().contains(&q) || topic.to_lowercase().contains(&q)
+        })
+        .cloned()
+        .collect()
 }

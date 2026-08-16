@@ -11,6 +11,8 @@ pub mod api;
 pub mod model;
 
 #[cfg(feature = "matrix")]
+pub mod directory;
+#[cfg(feature = "matrix")]
 pub mod live;
 #[cfg(feature = "matrix")]
 pub mod media;
@@ -48,6 +50,9 @@ mod matrix_impl {
         // `conversations()` clones it. Kept identical to the bound
         // `ClientState::convos` signal.
         snapshot: Arc<RwLock<Vec<Convo>>>,
+        // Same arrangement for spaces (checkpoint 09): written by the sync
+        // task, cloned by `spaces()`.
+        spaces_snapshot: Arc<RwLock<Vec<Space>>>,
         // Keep the runtime alive for as long as we might send commands.
         _runtime: ClientRuntime,
     }
@@ -65,6 +70,7 @@ mod matrix_impl {
             Self {
                 tx,
                 snapshot: Arc::new(RwLock::new(Vec::new())),
+                spaces_snapshot: Arc::new(RwLock::new(Vec::new())),
                 _runtime: runtime,
             }
         }
@@ -80,16 +86,6 @@ mod matrix_impl {
             reply_rx
                 .await
                 .map_err(|_| ClientError("The Matrix runtime stopped responding.".into()))?
-        }
-
-        fn unimplemented(error_hint: &'static str) -> ClientError {
-            tracing::warn!("{error_hint}: not implemented yet (later checkpoint)");
-            ClientError("Not implemented yet.".into())
-        }
-
-        fn empty_vec<T>(what: &'static str) -> Vec<T> {
-            tracing::warn!("{what}: returning empty until later checkpoint");
-            Vec::new()
         }
     }
 
@@ -131,12 +127,15 @@ mod matrix_impl {
             let _ = self.tx.send(Command::BindState {
                 state,
                 snapshot: self.snapshot.clone(),
+                spaces: self.spaces_snapshot.clone(),
             });
         }
 
         async fn spaces(&self) -> Vec<Space> {
-            // Spaces are checkpoint 09.
-            Vec::new()
+            self.spaces_snapshot
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
         async fn conversations(&self) -> Vec<Convo> {
             self.snapshot
@@ -306,14 +305,45 @@ mod matrix_impl {
                 })
         }
 
-        async fn public_rooms(&self) -> Vec<PublicRoom> {
-            Self::empty_vec("public_rooms")
+        // Checkpoint 09: paged, query-driven directory + join/leave. All of
+        // them are network round-trips answered from spawned tasks on the
+        // runtime thread.
+        async fn public_rooms(
+            &self,
+            query: String,
+            batch_token: Option<String>,
+        ) -> Result<PublicRoomPage, ClientError> {
+            self.ask(move |reply| Command::PublicRooms {
+                query,
+                batch_token,
+                reply,
+            })
+            .await
         }
-        async fn public_spaces(&self) -> Vec<PublicSpace> {
-            Self::empty_vec("public_spaces")
+        async fn public_spaces(
+            &self,
+            query: String,
+            batch_token: Option<String>,
+        ) -> Result<PublicSpacePage, ClientError> {
+            self.ask(move |reply| Command::PublicSpaces {
+                query,
+                batch_token,
+                reply,
+            })
+            .await
         }
-        async fn join_room(&self, _room_id: &str) -> Result<(), ClientError> {
-            Err(Self::unimplemented("join_room"))
+        async fn join_room(&self, room_id_or_alias: &str) -> Result<(), ClientError> {
+            let target = room_id_or_alias.to_string();
+            self.ask(move |reply| Command::JoinRoom {
+                id_or_alias: target,
+                reply,
+            })
+            .await
+        }
+        async fn leave_room(&self, room_id: &str) -> Result<(), ClientError> {
+            let room_id = room_id.to_string();
+            self.ask(move |reply| Command::LeaveRoom { room_id, reply })
+                .await
         }
 
         // Checkpoint 07: media resolve (data URI) and file-card download.

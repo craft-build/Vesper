@@ -14,10 +14,23 @@ pub struct Me {
     pub avatar: Option<String>,
 }
 
+/// A joined Matrix space, as a shallow summary (checkpoint 09).
+///
+/// Children are the room ids advertised by the space's `m.space.child`
+/// state events — spec-ordered (the `order` key, then event time, then id) —
+/// filtered down to rooms this account has joined. v1 renders one level
+/// only: a nested space's own entry also appears top-level in the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Space {
     pub id: String,
     pub name: String,
+    /// Space avatar (`mxc://`), resolved through the media cache (07).
+    pub avatar: Option<String>,
+    /// Joined member count, when the sync has seen it.
+    pub members: Option<u32>,
+    /// Child room ids in spec order (`m.space.child` `order` key first,
+    /// lexicographically; unordered children after, by event time).
+    pub children: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +280,9 @@ pub enum VerificationAction {
     Cancel,
 }
 
+/// One room of the homeserver's public directory (checkpoint 09). Everything
+/// here arrives with the directory response itself — no per-room preview API
+/// call needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicRoom {
     pub id: String,
@@ -275,9 +291,28 @@ pub struct PublicRoom {
     pub topic: String,
 }
 
+/// One page of the public room directory: rooms matching the query plus the
+/// token to fetch the next page (`None` = end of results).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PublicRoomPage {
+    pub rooms: Vec<PublicRoom>,
+    pub next: Option<String>,
+}
+
+/// One space of the homeserver's public directory. The directory endpoint
+/// has no child-count field, so `members` is the joined-member count (the
+/// closest signal for "how active is this space").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicSpace {
     pub id: String,
     pub name: String,
-    pub rooms: u32,
+    pub members: u32,
+    pub topic: String,
+}
+
+/// One page of the public space directory (see [`PublicRoomPage`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PublicSpacePage {
+    pub spaces: Vec<PublicSpace>,
+    pub next: Option<String>,
 }

@@ -16,13 +16,13 @@
 //! accessor in 0.18 and no UI surface yet — deferred (docs/03 §Design
 //! decisions permits this).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use dioxus_signals::{ReadableExt, Signal, SyncStorage, WritableExt};
 use eyeball_im::VectorDiff;
 use futures::StreamExt;
-use matrix_sdk::{Client, RoomState};
+use matrix_sdk::{ruma::events::space::child::SpaceChildEventContent, Client, RoomState};
 use matrix_sdk_ui::{
     room_list_service::{
         filters::new_filter_all, RoomListItem, RoomListLoadingState, RoomListService,
@@ -32,7 +32,7 @@ use matrix_sdk_ui::{
 
 use crate::{
     api::{ClientError, ClientState},
-    model::{Convo, ConvoKind, Presence},
+    model::{Convo, ConvoKind, Presence, Space},
 };
 
 /// Page size for the room list's dynamic entries controller. Pagination is a
@@ -57,14 +57,18 @@ impl SyncHandles {
 
 /// Start syncing the room list for a freshly connected `client`.
 ///
-/// Publishes every batch into `state.convos` / `state.connecting` and keeps
-/// `snapshot` identical to the signal's value. Errors are returned (not
-/// panicked) — typically a homeserver without simplified sliding sync.
+/// Publishes every batch into `state.convos` / `state.spaces` /
+/// `state.connecting` and keeps the snapshots identical to the signals.
+/// Errors are returned (not panicked) — typically a homeserver without
+/// simplified sliding sync.
 pub async fn start_room_list(
     client: Client,
     state: ClientState,
-    snapshot: Arc<RwLock<Vec<Convo>>>,
+    snapshot: &Arc<RwLock<Vec<Convo>>>,
+    spaces_snapshot: &Arc<RwLock<Vec<Space>>>,
 ) -> Result<SyncHandles, ClientError> {
+    let snapshot = snapshot.clone();
+    let spaces_snapshot = spaces_snapshot.clone();
     let service = SyncService::builder(client.clone())
         // Retry internally on network loss instead of dying: state flips to
         // `SyncState::Offline` and we surface "connecting…" in the UI.
@@ -94,6 +98,7 @@ pub async fn start_room_list(
     // Signals are `Copy` handles; bind them as locals so writes through them
     // from this runtime thread are plainly legal (they use SyncStorage).
     let mut convos_signal = state.convos;
+    let mut spaces_signal = state.spaces;
     let mut connecting = state.connecting;
     let presence_signal = state.presence;
     // `connecting` should only flip to false once (the sync state's offline
@@ -127,10 +132,9 @@ pub async fn start_room_list(
                         apply_diffs(&mut items, batch);
                         // Invites show up in `all_rooms` too; the UI has
                         // nowhere to render them — skip + log count (docs/03).
-                        const NOT_INVITED: fn(&&RoomListItem) -> bool =
-                            |i| i.state() != RoomState::Invited;
-                        let invite_count = items.len()
-                            - items.iter().filter(NOT_INVITED).count();
+                        const JOINED: fn(&&RoomListItem) -> bool =
+                            |i| i.state() == RoomState::Joined;
+                        let invite_count = items.len() - items.iter().filter(JOINED).count();
                         if invite_count != logged_invites {
                             tracing::info!(
                                 count = invite_count,
@@ -138,14 +142,28 @@ pub async fn start_room_list(
                             );
                             logged_invites = invite_count;
                         }
+                        // Spaces (checkpoint 09): joined rooms whose create
+                        // event says `m.space`. They leave the flat convo
+                        // list (the drawer renders them as section headers)
+                        // and their `m.space.child` state decides which
+                        // rooms group underneath.
+                        let spaces: Vec<Space> = futures::future::join_all(
+                            items
+                                .iter()
+                                .filter(|i| i.state() == RoomState::Joined && i.is_space())
+                                .map(map_space),
+                        )
+                        .await;
+                        let membership = space_membership(&spaces);
                         let mapped: Vec<Convo> = futures::future::join_all(
                             items
                                 .iter()
-                                .filter(NOT_INVITED)
-                                .map(|i| map_item(i, own_id.as_ref(), presence_signal)),
+                                .filter(|i| i.state() == RoomState::Joined && !i.is_space())
+                                .map(|i| map_item(i, own_id.as_ref(), presence_signal, &membership)),
                         )
                         .await;
                         publish(&mut convos_signal, &snapshot, mapped);
+                        publish_spaces(&mut spaces_signal, &spaces_snapshot, spaces);
                     }
                     None => break,
                 },
@@ -190,6 +208,78 @@ fn publish(
     signal.set(convos);
 }
 
+/// Same as [`publish`] for the spaces list (`spaces()`).
+fn publish_spaces(
+    signal: &mut Signal<Vec<Space>, SyncStorage>,
+    snapshot: &Arc<RwLock<Vec<Space>>>,
+    spaces: Vec<Space>,
+) {
+    *snapshot.write().unwrap_or_else(|e| e.into_inner()) = spaces.clone();
+    signal.set(spaces);
+}
+
+/// Map one space room to the UI's [`Space`] summary. Children come from the
+/// room's `m.space.child` state events, spec-ordered (the `order` key
+/// lexicographically first, then event time, then room id). Children are
+/// kept as plain ids — membership filtering against the joined-room set
+/// happens in [`space_membership`], and the drawer only ever finds joined
+/// rooms to group anyway. One level deep (docs/09): a nested space's entry
+/// stays in `children` but also renders as its own top-level space.
+async fn map_space(item: &RoomListItem) -> Space {
+    let mut children: Vec<(String, Option<String>, u64)> = item
+        .get_state_events_static::<SpaceChildEventContent>()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|raw| raw.deserialize().ok())
+        .filter_map(|event| {
+            let event = event.as_sync()?.as_original()?;
+            // Spec: a child only counts when its content carries a non-empty
+            // `via` (redacted / stripped entries don't).
+            if event.content.via.is_empty() {
+                return None;
+            }
+            Some((
+                event.state_key.to_string(),
+                event.content.order.as_ref().map(|o| o.to_string()),
+                u64::from(event.origin_server_ts.get()),
+            ))
+        })
+        .collect();
+    children.sort_by(|a, b| {
+        // `order` present beats absent; present orders compare as strings
+        // (spec: lexicographic on codepoints), then by event time, then by
+        // room id (the tuple's first element).
+        (a.1.is_none(), &a.1, a.2, &a.0).cmp(&(b.1.is_none(), &b.1, b.2, &b.0))
+    });
+    Space {
+        id: item.room_id().to_string(),
+        name: item
+            .cached_display_name()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| "Unknown space".into()),
+        avatar: item.avatar_url().map(|u| u.to_string()),
+        members: Some(item.joined_members_count().min(u32::MAX as u64) as u32),
+        children: children.into_iter().map(|(id, _, _)| id).collect(),
+    }
+}
+
+/// Reverse index of [`Space::children`]: room id → the space it should group
+/// under. A room listed by several spaces joins the first one that lists it
+/// (spaces are iterated in sync order); everything missing from the index
+/// lands in the drawer's ungrouped bucket.
+fn space_membership(spaces: &[Space]) -> HashMap<String, String> {
+    let mut membership = HashMap::new();
+    for space in spaces {
+        for child in &space.children {
+            membership
+                .entry(child.clone())
+                .or_insert_with(|| space.id.clone());
+        }
+    }
+    membership
+}
+
 /// Map one room list item to the UI's `Convo` shape. Mostly cache reads
 /// (they were pre-computed for the filters); `is_direct` is the only async
 /// store lookup, batched via `join_all` by the caller. For DMs (checkpoint 06)
@@ -203,6 +293,7 @@ async fn map_item(
         BTreeMap<String, Presence>,
         dioxus_signals::SyncStorage,
     >,
+    membership: &HashMap<String, String>,
 ) -> Convo {
     use matrix_sdk::RoomMemberships;
     let is_dm = item.is_direct().await.unwrap_or(false);
@@ -255,8 +346,9 @@ async fn map_item(
         mxid,
         status,
         topic: item.topic(),
-        // Spaces are checkpoint 09.
-        space: None,
+        // Space grouping (checkpoint 09): the space whose `m.space.child`
+        // lists this room; `None` → the drawer's ungrouped bucket.
+        space: membership.get(item.room_id().as_str()).cloned(),
         members: Some(item.joined_members_count().min(u32::MAX as u64) as u32),
     }
 }
@@ -299,6 +391,32 @@ pub(crate) fn apply_diffs<T: Clone>(vec: &mut Vec<T>, diffs: Vec<VectorDiff<T>>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn space(id: &str, children: &[&str]) -> Space {
+        Space {
+            id: id.into(),
+            name: id.into(),
+            avatar: None,
+            members: None,
+            children: children.iter().map(|c| (*c).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn space_membership_first_space_wins() {
+        let spaces = vec![space("one", &["a", "b"]), space("two", &["b", "c"])];
+        let membership = space_membership(&spaces);
+        // "b" is listed by both; the first space that lists it claims it.
+        assert_eq!(membership["a"], "one");
+        assert_eq!(membership["b"], "one");
+        assert_eq!(membership["c"], "two");
+    }
+
+    #[test]
+    fn space_membership_empty_for_ungrouped() {
+        let membership = space_membership(&[space("one", &["a"])]);
+        assert!(!membership.contains_key("z"));
+    }
 
     #[test]
     fn apply_diffs_handles_every_variant() {

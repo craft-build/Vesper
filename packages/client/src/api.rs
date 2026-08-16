@@ -75,6 +75,12 @@ pub struct ClientState {
     /// MXC media is content-addressed, so entries never need invalidation;
     /// on-disk persistence across restarts is the SqliteMediaStore's job.
     pub media: Signal<BTreeMap<String, String>, SyncStorage>,
+    /// Joined Matrix spaces (checkpoint 09), recomputed by the room-list
+    /// sync task whenever the room list or a space's children change. The
+    /// nav drawer groups rooms under these; the ⌘K switcher stays flat.
+    /// Same App-scope lifecycle as the maps above (see the lifecycle note
+    /// on this struct).
+    pub spaces: Signal<Vec<Space>, SyncStorage>,
     /// The active interactive verification session, if any (checkpoint 08).
     /// Written by the backend's verification driver from the tokio thread,
     /// read by the verify dialog; `None` when no session is running. One
@@ -132,6 +138,10 @@ pub trait VesperClient {
     /// signals so components re-render live.
     fn bind_state(&self, state: ClientState);
 
+    /// The signed-in account's joined spaces (checkpoint 09), latest
+    /// snapshot. Components that want live updates should read
+    /// [`ClientState::spaces`] instead — this is the one-shot fallback for
+    /// snapshot-only backends.
     async fn spaces(&self) -> Vec<Space>;
     /// Direct messages and rooms combined, mirroring the prototype's `[...dms, ...rooms]`.
     ///
@@ -229,9 +239,30 @@ pub trait VesperClient {
         let _ = action;
     }
 
-    async fn public_rooms(&self) -> Vec<PublicRoom>;
-    async fn public_spaces(&self) -> Vec<PublicSpace>;
-    async fn join_room(&self, room_id: &str) -> Result<(), ClientError>;
+    /// One page of the homeserver's public room directory (checkpoint 09)
+    /// matching `query` (server-side search; empty = browse all), continuing
+    /// after `batch_token` from a previous page. `next` on the returned page
+    /// feeds the next call; `None` means the end.
+    async fn public_rooms(
+        &self,
+        query: String,
+        batch_token: Option<String>,
+    ) -> Result<PublicRoomPage, ClientError>;
+    /// Same as [`Self::public_rooms`] but restricted to spaces
+    /// (`room_type: m.space` server-side where supported, client-filtered
+    /// otherwise).
+    async fn public_spaces(
+        &self,
+        query: String,
+        batch_token: Option<String>,
+    ) -> Result<PublicSpacePage, ClientError>;
+    /// Join a public room by id or alias. "Already joined" is a success, not
+    /// an error; rate-limit failures (`M_LIMIT_EXCEEDED`) surface as an
+    /// [`ClientError`] whose message carries a retry-after hint. On success
+    /// the room arrives through the room-list stream — no manual merge.
+    async fn join_room(&self, room_id_or_alias: &str) -> Result<(), ClientError>;
+    /// Leave `room_id`; the room-list stream drops it from the list.
+    async fn leave_room(&self, room_id: &str) -> Result<(), ClientError>;
 
     /// Resolve media to a renderable URL (checkpoint 07): returns a `data:`
     /// URI (base64) the webview can place directly in `img { src }`.

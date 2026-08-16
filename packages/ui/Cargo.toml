@@ -13,6 +13,9 @@ dioxus = { workspace = true, features = ["router"] }
 async-trait = "0.1"
 regex = "1"
 tracing = "0.1"
+# Checkpoint 09: portable async sleep for the discovery modal's search
+# debounce (works on both the desktop and wasm targets).
+futures-timer = "3"
 # Trait seam + domain types live here; wasm gets this with default features
 # off (no matrix-sdk), native additionally gets the real MatrixClient below.
 client = { workspace = true, default-features = false }

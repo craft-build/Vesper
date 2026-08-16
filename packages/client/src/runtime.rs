@@ -27,11 +27,24 @@ use tokio::{
 
 use crate::{
     api::{ClientError, ClientState},
+    directory,
     live::{LiveHandles, TypingManager},
-    model::{Attachment, Convo, Me, Reaction, ThreadReply, VerificationSession, VerificationState},
+    model::{
+        Attachment, Convo, Me, PublicRoomPage, PublicSpacePage, Reaction, Space, ThreadReply,
+        VerificationSession, VerificationState,
+    },
     session, sync,
     timeline::TimelineRegistry,
 };
+
+/// The UI-bound handles cached from `BindState`: the live signal struct plus
+/// the synchronous snapshots backing `conversations()` / `spaces()`. Both
+/// halves are kept identical to their signals by the sync task.
+struct Bound {
+    state: ClientState,
+    snapshot: Arc<RwLock<Vec<Convo>>>,
+    spaces: Arc<RwLock<Vec<Space>>>,
+}
 
 /// Commands the UI can send into the Matrix runtime.
 ///
@@ -65,12 +78,14 @@ pub enum Command {
     /// The cached identity snapshot, if a session is active.
     WhoAmI { reply: oneshot::Sender<Option<Me>> },
     /// Hand the UI-created live state to the runtime so sync can publish into
-    /// it. `snapshot` belongs to `MatrixClient` and backs `conversations()`;
-    /// the sync task keeps it identical to `state.convos`. Arrives once after
-    /// the Dioxus scope exists — before or after login, either is fine.
+    /// it. The snapshots belong to `MatrixClient` and back
+    /// `conversations()` / `spaces()`; the sync task keeps them identical to
+    /// `state.convos` / `state.spaces`. Arrives once after the Dioxus scope
+    /// exists — before or after login, either is fine.
     BindState {
         state: ClientState,
         snapshot: Arc<RwLock<Vec<Convo>>>,
+        spaces: Arc<RwLock<Vec<Space>>>,
     },
     /// Open (refcounted) the live timeline for `room_id`; publishes mapped
     /// messages into `state.messages`. Fire-and-forget: failures are logged,
@@ -177,6 +192,31 @@ pub enum Command {
     FetchDevices {
         reply: oneshot::Sender<Result<Vec<crate::model::Device>, ClientError>>,
     },
+    /// One page of the public room directory matching `query`, continuing
+    /// after `batch_token` (checkpoint 09). Answered from a spawned task.
+    PublicRooms {
+        query: String,
+        batch_token: Option<String>,
+        reply: oneshot::Sender<Result<PublicRoomPage, ClientError>>,
+    },
+    /// One page of the public space directory (checkpoint 09). Answered
+    /// from a spawned task.
+    PublicSpaces {
+        query: String,
+        batch_token: Option<String>,
+        reply: oneshot::Sender<Result<PublicSpacePage, ClientError>>,
+    },
+    /// Join a public room by id or alias (checkpoint 09). Answered from a
+    /// spawned task; on success the room arrives via the room-list stream.
+    JoinRoom {
+        id_or_alias: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    /// Leave a joined room (checkpoint 09). Answered from a spawned task.
+    LeaveRoom {
+        room_id: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
 }
 
 /// Post-login send-queue setup (checkpoint 05): make sure the global send
@@ -252,7 +292,7 @@ fn spawn_crypto_setup(client: &Client) {
 /// dropped (unregistered) first.
 async fn restart_sync(
     sdk_client: &Option<Client>,
-    bound: &Option<(ClientState, Arc<RwLock<Vec<Convo>>>)>,
+    bound: &Option<Bound>,
     current: &mut Option<sync::SyncHandles>,
     live: &mut Option<LiveHandles>,
     typing: &TypingManager,
@@ -262,22 +302,22 @@ async fn restart_sync(
     }
     // Drop previous live handlers (unregisters them) before re-registering.
     *live = None;
-    let (Some(client), Some((state, snapshot))) = (sdk_client, bound) else {
+    let (Some(client), Some(bound)) = (sdk_client, bound) else {
         return;
     };
-    match sync::start_room_list(client.clone(), *state, snapshot.clone()).await {
+    match sync::start_room_list(client.clone(), bound.state, &bound.snapshot, &bound.spaces).await {
         Ok(handles) => *current = Some(handles),
         Err(e) => {
             tracing::warn!("room list sync failed to start: {}", e.0);
             // Don't strand the user at a permanently empty list: leave the
             // "connecting…" pill on so a non-delivering sync reads as one.
-            let mut state = *state;
+            let mut state = bound.state;
             state.connecting.set(true);
         }
     }
     // Typing resets per session (no stale timers across a re-login).
     typing.abort_all();
-    *live = Some(crate::live::start_live(client, *state));
+    *live = Some(crate::live::start_live(client, bound.state));
 }
 
 /// Map the SDK's device collection into the UI model. Crypto devices carry
@@ -322,7 +362,7 @@ impl ClientRuntime {
                     let mut me: Option<Me> = None;
                     // UI-bound live state (arrives via `BindState`) and the
                     // running room-list sync built from it + the client.
-                    let mut bound: Option<(ClientState, Arc<RwLock<Vec<Convo>>>)> = None;
+                    let mut bound: Option<Bound> = None;
                     let mut sync: Option<sync::SyncHandles> = None;
                     // Checkpoint 06: live-state tasks (presence + notifications)
                     // and the outgoing typing debounce manager. `typing_mgr`
@@ -406,11 +446,14 @@ impl ClientRuntime {
                                 if let Some(handles) = sync.take() {
                                     handles.stop().await;
                                 }
-                                if let Some((state, snapshot)) = &bound {
-                                    *snapshot.write().unwrap_or_else(|e| e.into_inner()) =
+                                if let Some(bound) = &bound {
+                                    *bound.snapshot.write().unwrap_or_else(|e| e.into_inner()) =
                                         Vec::new();
-                                    let mut state = *state;
+                                    *bound.spaces.write().unwrap_or_else(|e| e.into_inner()) =
+                                        Vec::new();
+                                    let mut state = bound.state;
                                     state.convos.set(Vec::new());
+                                    state.spaces.set(Vec::new());
                                     state.connecting.set(false);
                                 }
                                 // Timelines die with the session; blank their
@@ -431,17 +474,16 @@ impl ClientRuntime {
                                 if let Some(session) = verification.take() {
                                     session.abort();
                                 }
-                                if let Some((state, _)) = &bound {
-                                    let mut state = *state;
+                                if let Some(bound) = &bound {
+                                    let mut state = bound.state;
                                     state.messages.set(Default::default());
                                     state.threads.set(Default::default());
                                     state.typing.set(Default::default());
                                     state.presence.set(Default::default());
                                     state.verification.set(None);
-                                }
-                                // Take the client (by value) so the session
-                                // module can drop it — closing sqlite handles —
-                                // before deleting the store dir.
+                                } // Take the client (by value) so the session
+                                  // module can drop it — closing sqlite handles —
+                                  // before deleting the store dir.
                                 let result = session::logout(sdk_client.take()).await;
                                 me = None;
                                 let _ = reply.send(result);
@@ -449,8 +491,16 @@ impl ClientRuntime {
                             Command::WhoAmI { reply } => {
                                 let _ = reply.send(me.clone());
                             }
-                            Command::BindState { state, snapshot } => {
-                                bound = Some((state, snapshot));
+                            Command::BindState {
+                                state,
+                                snapshot,
+                                spaces,
+                            } => {
+                                bound = Some(Bound {
+                                    state,
+                                    snapshot,
+                                    spaces,
+                                });
                                 restart_sync(
                                     &sdk_client,
                                     &bound,
@@ -461,8 +511,8 @@ impl ClientRuntime {
                                 .await;
                             }
                             Command::OpenTimeline { room_id } => {
-                                if let (Some(client), Some((state, _))) = (&sdk_client, &bound) {
-                                    timelines.open(client, &room_id, *state).await;
+                                if let (Some(client), Some(bound)) = (&sdk_client, &bound) {
+                                    timelines.open(client, &room_id, bound.state).await;
                                 }
                             }
                             Command::CloseTimeline { room_id } => {
@@ -595,8 +645,8 @@ impl ClientRuntime {
                                     reply.send(timelines.thread_replies(&room_id, &root_id).await);
                             }
                             Command::OpenThread { room_id, root_id } => {
-                                if let Some((state, _)) = &bound {
-                                    timelines.open_thread(&room_id, &root_id, *state).await;
+                                if let Some(bound) = &bound {
+                                    timelines.open_thread(&room_id, &root_id, bound.state).await;
                                 }
                             }
                             Command::CloseThread { root_id } => {
@@ -608,17 +658,17 @@ impl ClientRuntime {
                                 }
                             }
                             Command::MarkRead { room_id } => {
-                                if let (Some(client), Some((state, _))) = (&sdk_client, &bound) {
-                                    timelines.mark_read(client, &room_id, *state);
+                                if let (Some(client), Some(bound)) = (&sdk_client, &bound) {
+                                    timelines.mark_read(client, &room_id, bound.state);
                                 }
                             }
                             Command::StartVerification { target } => {
-                                let (Some(client), Some((state, _))) = (&sdk_client, &bound) else {
+                                let (Some(client), Some(bound)) = (&sdk_client, &bound) else {
                                     // Tell the UI instead of a silent no-op
                                     // (review P3): the dialog would otherwise
                                     // sit blank forever.
-                                    if let Some((state, _)) = &bound {
-                                        let mut verification = state.verification;
+                                    if let Some(bound) = &bound {
+                                        let mut verification = bound.state.verification;
                                         verification.set(Some(VerificationSession {
                                             subject: String::new(),
                                             target: target.clone(),
@@ -647,7 +697,10 @@ impl ClientRuntime {
                                 // cancel-on-replacement is taken inside.
                                 verification = Some(
                                     crate::verification::Session::start(
-                                        client, target, subject, *state,
+                                        client,
+                                        target,
+                                        subject,
+                                        bound.state,
                                     )
                                     .await,
                                 );
@@ -667,6 +720,60 @@ impl ClientRuntime {
                                         tracing::warn!("devices fetch failed: {e:?}");
                                         ClientError("Could not load sessions.".into())
                                     });
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Command::PublicRooms {
+                                query,
+                                batch_token,
+                                reply,
+                            } => {
+                                // Spawned: directory queries are network
+                                // round-trips and the command loop is
+                                // sequential (checkpoint-06 lesson).
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                tokio::spawn(async move {
+                                    let result =
+                                        directory::public_rooms(&client, &query, batch_token).await;
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Command::PublicSpaces {
+                                query,
+                                batch_token,
+                                reply,
+                            } => {
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                tokio::spawn(async move {
+                                    let result =
+                                        directory::public_spaces(&client, &query, batch_token)
+                                            .await;
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Command::JoinRoom { id_or_alias, reply } => {
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                tokio::spawn(async move {
+                                    let result = directory::join_room(&client, &id_or_alias).await;
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Command::LeaveRoom { room_id, reply } => {
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                tokio::spawn(async move {
+                                    let result = directory::leave_room(&client, &room_id).await;
                                     let _ = reply.send(result);
                                 });
                             }

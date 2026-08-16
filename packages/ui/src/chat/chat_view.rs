@@ -28,6 +28,7 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
     // drawer and switcher re-render as rooms/unread counts change — no fetch.
     let sync = use_context::<ClientState>();
     let all_convos = (sync.convos)();
+    let spaces = (sync.spaces)();
 
     let dms: Vec<_> = all_convos
         .iter()
@@ -157,6 +158,26 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
     let active_id = convo.as_ref().map(|c| c.id.clone()).unwrap_or_default();
     let is_mobile = (ui.is_mobile)();
 
+    // Checkpoint 09: leaving from the drawer's right-click menu. The list
+    // update arrives through the convos signal (mock republishes, the real
+    // backend's room-list stream drops the room); if the open room is the
+    // one being left, fall back to the empty state first.
+    let leave_room = {
+        let client = client.clone();
+        let active_id = active_id.clone();
+        move |id: String| {
+            if active_id == id {
+                navigator.push(Route::Home {});
+            }
+            let client = client.clone();
+            spawn(async move {
+                if let Err(e) = client.leave_room(&id).await {
+                    tracing::warn!("leave_room: {}", e.0);
+                }
+            });
+        }
+    };
+
     // The currently-open room (checkpoint 06): published to `sync.active_room`
     // so the desktop-notification task suppresses notifications for the room
     // the user is already in. Guarded against same-value writes so an
@@ -194,6 +215,7 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                 NavDrawer {
                     dms: dms.clone(),
                     rooms: rooms.clone(),
+                    spaces: spaces.clone(),
                     active_id: active_id.clone(),
                     on_select: select_convo.clone(),
                     on_close: move |_| ui.nav_open.set(false),
@@ -203,6 +225,7 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                         let me = me.clone();
                         move |_| { ui.nav_open.set(false); ui.side_panel.set(Some(SidePanel::Profile { target: me.as_ref().map(ProfileTarget::own).unwrap_or_else(|| ProfileTarget::person("You", "@you:vesper.chat")) })); }
                     },
+                    on_leave: leave_room.clone(),
                     me_avatar: me_avatar.clone(),
                     inline: true,
                 }
@@ -274,6 +297,7 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                 NavDrawer {
                     dms: dms.clone(),
                     rooms: rooms.clone(),
+                    spaces: spaces.clone(),
                     active_id: active_id.clone(),
                     on_select: select_convo.clone(),
                     on_close: move |_| ui.nav_open.set(false),
@@ -283,6 +307,7 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                         let me = me.clone();
                         move |_| { ui.nav_open.set(false); ui.side_panel.set(Some(SidePanel::Profile { target: me.as_ref().map(ProfileTarget::own).unwrap_or_else(|| ProfileTarget::person("You", "@you:vesper.chat")) })); }
                     },
+                    on_leave: leave_room,
                     me_avatar: me_avatar.clone(),
                     inline: false,
                 }
