@@ -224,6 +224,73 @@ pub trait VesperClient {
 
     async fn devices(&self) -> Vec<Device>;
 
+    // ------------------------------------------------------------------
+    // Account console (checkpoint 10): profile, sessions, notification
+    // rules, and device-local prefs. Every method has a mock counterpart
+    // so the settings UI stays demoable offline.
+    // ------------------------------------------------------------------
+
+    /// Set the account display name server-side. Returns the fresh identity
+    /// snapshot so the caller can rewrite its `Me` signal and repaint the
+    /// shell. Empty names are rejected (they would *remove* the name).
+    async fn set_display_name(&self, name: String) -> Result<Me, ClientError> {
+        let _ = name;
+        Err(ClientError("Not supported by this backend.".into()))
+    }
+
+    /// Upload `path`'s bytes as the account avatar (the file is picked on
+    /// the UI side; the backend reads bytes + sniffs the mime type). Returns
+    /// the fresh identity snapshot with the new `avatar` mxc.
+    async fn set_avatar(&self, path: String) -> Result<Me, ClientError> {
+        let _ = path;
+        Err(ClientError("Not supported by this backend.".into()))
+    }
+
+    /// Rename a session by device id (no re-auth needed).
+    async fn rename_device(&self, device_id: String, name: String) -> Result<(), ClientError> {
+        let _ = (device_id, name);
+        Err(ClientError("Not supported by this backend.".into()))
+    }
+
+    /// Delete another session, re-authenticating with `password` if the
+    /// homeserver demands it (UIAA `m.login.password`; the backend owns the
+    /// stage-completion dance). Deleting the current device is rejected —
+    /// use [`Self::logout`]. The password never appears in logs or errors.
+    async fn delete_device(&self, device_id: String, password: String) -> Result<(), ClientError> {
+        let _ = (device_id, password);
+        Err(ClientError("Not supported by this backend.".into()))
+    }
+
+    /// The push-rule toggles of the notification settings (see
+    /// `client::notifications::RULE_TABLE` for the toggle↔rule mapping).
+    async fn notification_rules(&self) -> Result<Vec<NotifToggle>, ClientError> {
+        Err(ClientError("Not supported by this backend.".into()))
+    }
+
+    /// Flip one toggle (writing every Matrix rule behind it) and return the
+    /// full refreshed list — the caller replaces its state wholesale, no
+    /// optimistic patch to reconcile.
+    async fn set_notification_rule(
+        &self,
+        toggle_id: String,
+        enabled: bool,
+    ) -> Result<Vec<NotifToggle>, ClientError> {
+        let _ = (toggle_id, enabled);
+        Err(ClientError("Not supported by this backend.".into()))
+    }
+
+    /// Device-local application preferences (theme, receipt/typing opt-outs)
+    /// persisted next to the session. Snapshot-only: reads are cheap and
+    /// local, no signal plumbing needed.
+    async fn prefs(&self) -> Prefs {
+        Prefs::default()
+    }
+    /// Persist preferences (versioned `prefs.json`).
+    async fn set_prefs(&self, prefs: Prefs) -> Result<(), ClientError> {
+        let _ = prefs;
+        Err(ClientError("Not supported by this backend.".into()))
+    }
+
     /// Start (or replace) an interactive verification session against
     /// `target` (checkpoint 08). Progress arrives through
     /// [`ClientState::verification`]; errors surface there as

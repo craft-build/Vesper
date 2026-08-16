@@ -15,6 +15,9 @@
 //!   restore; deleting it (or reusing the store without it) makes the sqlite
 //!   crypto store unopenable, so `cleanup_files` removes it together with
 //!   the session and store dir. Keyring migration is checkpoint-11.
+//! - `prefs.json` — device-local application preferences (checkpoint 10),
+//!   versioned + serde-default tolerant. Wiped with the session: preferences
+//!   are device-local by definition, and a fresh device starts fresh.
 //!
 //! Credentials never land in logs or user-facing strings: SDK errors are
 //! classified by [`friendly_error`] and reduced to fixed sentences (raw errors
@@ -27,7 +30,10 @@ use matrix_sdk::{
     HttpError, ThreadingSupport,
 };
 
-use crate::{api::ClientError, model::Me};
+use crate::{
+    api::ClientError,
+    model::{Me, Prefs},
+};
 
 fn data_dir() -> Result<PathBuf, ClientError> {
     // Honor an explicit override first — tests and dev tooling set this so we
@@ -50,6 +56,36 @@ fn session_path() -> Result<PathBuf, ClientError> {
 
 fn passphrase_path() -> Result<PathBuf, ClientError> {
     Ok(data_dir()?.join("store-passphrase"))
+}
+
+fn prefs_path() -> Result<PathBuf, ClientError> {
+    Ok(data_dir()?.join("prefs.json"))
+}
+
+/// Load device-local preferences (checkpoint 10). A missing file is the
+/// normal first-run state → defaults; an unreadable/corrupt file is a warn
+/// + defaults, never a failure — bad prefs must not brick the app.
+pub(crate) fn load_prefs() -> Prefs {
+    let bytes = match std::fs::read(prefs_path().unwrap_or_else(|_| PathBuf::from("prefs.json"))) {
+        Ok(bytes) => bytes,
+        Err(_) => return Prefs::default(),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(prefs) => prefs,
+        Err(e) => {
+            tracing::warn!("prefs file unreadable, using defaults: {e}");
+            Prefs::default()
+        }
+    }
+}
+
+/// Persist preferences atomically-enough for v1 (truncate-write, `0600`).
+/// The file is tiny and written only from the settings screen.
+pub(crate) fn save_prefs(prefs: &Prefs) -> Result<(), ClientError> {
+    let bytes = serde_json::to_vec(prefs)
+        .map_err(|e| ClientError(format!("Could not serialize preferences: {e}")))?;
+    write_owner_only(&prefs_path()?, &bytes)
+        .map_err(|e| ClientError(format!("Could not write preferences: {e}")))
 }
 
 /// The state database file name matrix-sdk-sqlite uses inside the store dir
@@ -219,7 +255,7 @@ fn write_owner_only(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
 /// MXID localpart when the profile lookup fails (e.g. offline first paint).
 /// The user id comes from the session itself — no extra `whoami` round trip
 /// (callers that need one, like restore, do it explicitly).
-async fn me_snapshot(client: &Client) -> Me {
+pub(crate) async fn me_snapshot(client: &Client) -> Me {
     let id = client
         .session_meta()
         .map(|m| m.user_id.to_string())
@@ -343,7 +379,7 @@ pub async fn logout(client: Option<Client>) -> Result<(), ClientError> {
 }
 
 fn cleanup_files() {
-    let mut paths = vec![session_path(), passphrase_path(), store_dir()];
+    let mut paths = vec![session_path(), passphrase_path(), prefs_path(), store_dir()];
     for result in paths.drain(..) {
         let Ok(path) = result else { continue };
         if path.is_dir() {
@@ -446,6 +482,80 @@ pub(crate) mod tests {
             std::fs::write(dir.join("matrix-store/matrix-sdk-state.sqlite3"), b"").expect("db");
             assert_eq!(store_passphrase().expect("legacy branch"), None);
             assert!(!dir.join("store-passphrase").exists());
+        });
+    }
+
+    // Checkpoint 10: prefs round-trip, tolerance, and logout wipe.
+    #[test]
+    fn prefs_round_trip() {
+        with_data_dir(|_| {
+            let prefs = Prefs {
+                theme: "light".into(),
+                read_receipts: false,
+                ..Prefs::default()
+            };
+            save_prefs(&prefs).expect("save");
+            assert_eq!(load_prefs(), prefs);
+        });
+    }
+
+    #[test]
+    fn missing_prefs_file_is_default() {
+        with_data_dir(|_| {
+            assert_eq!(load_prefs(), Prefs::default());
+        });
+    }
+
+    #[test]
+    fn prefs_tolerate_unknown_and_missing_fields() {
+        with_data_dir(|_| {
+            // Unknown future fields are ignored; missing ones take defaults.
+            std::fs::write(
+                prefs_path().expect("path"),
+                br#"{"version":1,"theme":"dark","future_field":{"a":[1,2]}}"#,
+            )
+            .expect("write");
+            assert_eq!(load_prefs(), Prefs::default());
+            std::fs::write(prefs_path().expect("path"), br#"{"theme":"light"}"#).expect("write");
+            let loaded = load_prefs();
+            assert_eq!(loaded.theme, "light");
+            assert!(loaded.read_receipts, "missing field falls back to default");
+            assert_eq!(loaded.version, 1, "version default applied");
+        });
+    }
+
+    #[test]
+    fn corrupt_prefs_file_is_default_not_error() {
+        with_data_dir(|_| {
+            std::fs::write(prefs_path().expect("path"), b"{not json").expect("write");
+            assert_eq!(load_prefs(), Prefs::default());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefs_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        with_data_dir(|_| {
+            save_prefs(&Prefs::default()).expect("save");
+            let mode = prefs_path()
+                .expect("path")
+                .metadata()
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+        });
+    }
+
+    #[test]
+    fn cleanup_removes_prefs() {
+        with_data_dir(|_| {
+            save_prefs(&Prefs::default()).expect("save");
+            assert!(prefs_path().expect("path").exists());
+            cleanup_files();
+            assert!(!prefs_path().expect("path").exists());
         });
     }
 }

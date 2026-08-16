@@ -217,6 +217,57 @@ pub enum Command {
         room_id: String,
         reply: oneshot::Sender<Result<(), ClientError>>,
     },
+    /// Set the account display name; replies with the fresh identity
+    /// snapshot (checkpoint 10). Answered from a spawned task.
+    SetDisplayName {
+        name: String,
+        reply: oneshot::Sender<Result<Me, ClientError>>,
+    },
+    /// Read `path`, upload its bytes as the account avatar, and reply with
+    /// the fresh identity snapshot (checkpoint 10). Answered from a spawned
+    /// task so a slow upload never stalls the command loop.
+    SetAvatar {
+        path: String,
+        reply: oneshot::Sender<Result<Me, ClientError>>,
+    },
+    /// Rename a session by device id (checkpoint 10). Answered from a
+    /// spawned task.
+    RenameDevice {
+        device_id: String,
+        name: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    /// Delete another session, completing a UIAA password stage with
+    /// `password` when the server demands one (checkpoint 10). Answered from
+    /// a spawned task.
+    DeleteDevice {
+        device_id: String,
+        password: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    /// Read the notification push-rule toggles (checkpoint 10). Answered
+    /// from a spawned task.
+    NotificationRules {
+        reply: oneshot::Sender<Result<Vec<crate::model::NotifToggle>, ClientError>>,
+    },
+    /// Flip one toggle (writing every Matrix rule behind it); replies with
+    /// the full refreshed list (checkpoint 10). Answered from a spawned task.
+    SetNotificationRule {
+        toggle_id: String,
+        enabled: bool,
+        reply: oneshot::Sender<Result<Vec<crate::model::NotifToggle>, ClientError>>,
+    },
+    /// Read device-local preferences (checkpoint 10). Local file, cheap:
+    /// answered inline on the loop.
+    GetPrefs {
+        reply: oneshot::Sender<crate::model::Prefs>,
+    },
+    /// Persist device-local preferences (checkpoint 10). Local file, cheap:
+    /// answered inline.
+    SetPrefs {
+        prefs: crate::model::Prefs,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
 }
 
 /// Post-login send-queue setup (checkpoint 05): make sure the global send
@@ -320,26 +371,177 @@ async fn restart_sync(
     *live = Some(crate::live::start_live(client, bound.state));
 }
 
-/// Map the SDK's device collection into the UI model. Crypto devices carry
-/// no last-seen timestamp (that's the `/devices` HTTP endpoint's data), so
-/// `last_seen` is a placeholder until we merge both sources.
+/// Map the account's devices into the UI model (checkpoint 10 upgrade).
+///
+/// Two sources merged: the `/devices` HTTP endpoint is authoritative for
+/// id/name/last-seen (it carries `last_seen_ts`/`last_seen_ip`, which the
+/// crypto device list lacks), and the crypto `get_user_devices` query
+/// supplies the verified flag. A crypto-query failure degrades to unverified
+/// flags rather than failing the whole list — verification badges disappearing
+/// offline is better than the settings screen going blank.
 async fn fetch_devices(client: &Client) -> Result<Vec<crate::model::Device>, matrix_sdk::Error> {
+    use std::collections::BTreeMap;
+
+    use matrix_sdk::ruma::OwnedDeviceId;
+
     let own = client
         .user_id()
         .ok_or_else(|| crate::verification::unknown_error("not signed in".into()))?;
-    let devices = client.encryption().get_user_devices(own).await?;
-    Ok(devices
-        .devices()
+    let listed = client.devices().await?.devices;
+    let current_id = client.device_id().map(|d| d.to_string());
+
+    let verified: BTreeMap<OwnedDeviceId, bool> = client
+        .encryption()
+        .get_user_devices(own)
+        .await
+        .map(|all| {
+            all.devices()
+                .map(|d| (d.device_id().to_owned(), d.is_verified()))
+                .collect()
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!("device trust query failed, showing all as unverified: {e:?}");
+            BTreeMap::new()
+        });
+
+    Ok(listed
+        .into_iter()
         .map(|d| crate::model::Device {
-            id: d.device_id().to_string(),
-            name: d
-                .display_name()
-                .map(str::to_string)
-                .unwrap_or_else(|| "Unnamed session".into()),
-            last_seen: "—".into(),
-            verified: d.is_verified(),
+            current: Some(d.device_id.to_string()) == current_id,
+            id: d.device_id.to_string(),
+            name: d.display_name.unwrap_or_else(|| "Unnamed session".into()),
+            last_seen: format_last_seen(
+                d.last_seen_ts.map(|ts| u64::from(ts.get())),
+                d.last_seen_ip.as_deref(),
+            ),
+            verified: verified.get(&d.device_id).copied().unwrap_or(false),
         })
         .collect())
+}
+
+/// Human-friendly "last seen" for a device row: relative age from unix-ms,
+/// optionally with the IP ("3 d ago · 1.2.3.4"). Mirrors the timeline's
+/// no-chrono date formatting (civil-days math).
+fn format_last_seen(ts: Option<u64>, ip: Option<&str>) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let Some(ms) = ts else {
+        return "Unknown".into();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(ms);
+    let age = now.saturating_sub(ms) / 1000; // seconds
+    let rel = if age < 60 {
+        "just now".to_string()
+    } else if age < 3600 {
+        format!("{} m ago", age / 60)
+    } else if age < 86_400 {
+        format!("{} h ago", age / 3600)
+    } else {
+        format!("{} d ago", age / 86_400)
+    };
+    match ip {
+        Some(ip) if !ip.is_empty() => format!("{rel} · {ip}"),
+        _ => rel,
+    }
+}
+
+// ----------------------------------------------------------------------
+// Account console helpers (checkpoint 10). All run inside spawned tasks,
+// never on the sequential command loop.
+// ----------------------------------------------------------------------
+
+/// Set the display name server-side and return the fresh identity snapshot.
+/// The runtime's cached `me` is refreshed by the caller (it owns the slot).
+async fn set_display_name(client: &Client, name: &str) -> Result<Me, ClientError> {
+    client
+        .account()
+        .set_display_name(Some(name))
+        .await
+        .map_err(|_| ClientError("Could not save your display name.".into()))?;
+    Ok(session::me_snapshot(client).await)
+}
+
+/// Read the picked avatar file, upload it, and return the fresh identity
+/// snapshot. `upload_avatar` uploads *and* sets the account avatar url in
+/// one call. Mime sniffing via `infer` (already a dep for checkpoint 07).
+async fn set_avatar(client: &Client, path: &str) -> Result<Me, ClientError> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|_| ClientError("Could not read the chosen image.".into()))?;
+    let kind = infer::get(&bytes)
+        .ok_or_else(|| ClientError("That file does not look like an image.".into()))?;
+    let mime: mime::Mime = kind
+        .mime_type()
+        .parse()
+        .map_err(|_| ClientError("Unsupported image type.".into()))?;
+    if mime.type_() != mime::IMAGE {
+        return Err(ClientError("Avatars must be images.".into()));
+    }
+    client
+        .account()
+        .upload_avatar(&mime, bytes)
+        .await
+        .map_err(|_| ClientError("Could not upload the image.".into()))?;
+    Ok(session::me_snapshot(client).await)
+}
+
+/// Read the rule table's toggles from the server push ruleset (checkpoint
+/// 10). A toggle reports enabled only when *all* its rules are enabled;
+/// missing rules (fresh login, ruleset not synced yet) read as the table
+/// default.
+async fn notification_toggles(
+    client: &Client,
+) -> Result<Vec<crate::model::NotifToggle>, ClientError> {
+    let settings = client.notification_settings().await;
+    let mut out = Vec::with_capacity(crate::notifications::RULE_TABLE.len());
+    for def in crate::notifications::RULE_TABLE {
+        let mut enabled = def.default;
+        for rule in def.rules {
+            let kind = map_rule_kind(rule.kind);
+            match settings.is_push_rule_enabled(kind, rule.rule_id).await {
+                Ok(v) => enabled = v,
+                Err(_) => {
+                    enabled = def.default;
+                    break;
+                }
+            }
+        }
+        out.push(crate::model::NotifToggle {
+            id: def.id.to_string(),
+            label: def.label.to_string(),
+            enabled,
+        });
+    }
+    Ok(out)
+}
+
+/// Flip one toggle, writing every Matrix rule behind it, then re-read.
+async fn set_notification_toggle(
+    client: &Client,
+    toggle_id: &str,
+    enabled: bool,
+) -> Result<Vec<crate::model::NotifToggle>, ClientError> {
+    let Some(def) = crate::notifications::toggle_def(toggle_id) else {
+        return Err(ClientError("Unknown notification setting.".into()));
+    };
+    let settings = client.notification_settings().await;
+    for rule in def.rules {
+        settings
+            .set_push_rule_enabled(map_rule_kind(rule.kind), rule.rule_id, enabled)
+            .await
+            .map_err(|_| ClientError("Could not save that notification setting.".into()))?;
+    }
+    notification_toggles(client).await
+}
+
+fn map_rule_kind(kind: crate::notifications::RuleKind) -> matrix_sdk::ruma::push::RuleKind {
+    match kind {
+        crate::notifications::RuleKind::Override => matrix_sdk::ruma::push::RuleKind::Override,
+        crate::notifications::RuleKind::Underride => matrix_sdk::ruma::push::RuleKind::Underride,
+    }
 }
 
 /// Owns the tokio runtime that matrix-sdk code runs on.
@@ -360,6 +562,10 @@ impl ClientRuntime {
                     // The SDK client lives and dies inside this task.
                     let mut sdk_client: Option<Client> = None;
                     let mut me: Option<Me> = None;
+                    // Checkpoint 10: same identity slot, shared so spawned
+                    // profile-save tasks (display name / avatar) can refresh
+                    // it without bouncing through the sequential loop.
+                    let me_cache = Arc::new(std::sync::RwLock::new(Option::<Me>::None));
                     // UI-bound live state (arrives via `BindState`) and the
                     // running room-list sync built from it + the client.
                     let mut bound: Option<Bound> = None;
@@ -398,6 +604,8 @@ impl ClientRuntime {
                                         // caller's await shouldn't wait on it.
                                         sdk_client = Some(client);
                                         me = Some(snapshot.clone());
+                                        *me_cache.write().unwrap_or_else(|e| e.into_inner()) =
+                                            Some(snapshot.clone());
                                         wire_send_queue(sdk_client.as_ref().expect("just set"))
                                             .await;
                                         let _ = reply.send(Ok(snapshot));
@@ -420,6 +628,8 @@ impl ClientRuntime {
                                 Ok(Some((client, snapshot))) => {
                                     sdk_client = Some(client);
                                     me = Some(snapshot.clone());
+                                    *me_cache.write().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(snapshot.clone());
                                     wire_send_queue(sdk_client.as_ref().expect("just set")).await;
                                     let _ = reply.send(Ok(Some(snapshot)));
                                     spawn_crypto_setup(sdk_client.as_ref().expect("just set"));
@@ -486,10 +696,15 @@ impl ClientRuntime {
                                   // before deleting the store dir.
                                 let result = session::logout(sdk_client.take()).await;
                                 me = None;
+                                *me_cache.write().unwrap_or_else(|e| e.into_inner()) = None;
                                 let _ = reply.send(result);
                             }
                             Command::WhoAmI { reply } => {
-                                let _ = reply.send(me.clone());
+                                // Read the shared slot: profile saves refresh
+                                // it from spawned tasks (checkpoint 10).
+                                let fresh =
+                                    me_cache.read().unwrap_or_else(|e| e.into_inner()).clone();
+                                let _ = reply.send(fresh.or_else(|| me.clone()));
                             }
                             Command::BindState {
                                 state,
@@ -777,6 +992,126 @@ impl ClientRuntime {
                                     let _ = reply.send(result);
                                 });
                             }
+                            Command::SetDisplayName { name, reply } => {
+                                // Empty would *remove* the name server-side;
+                                // the UI also guards, the backend enforces.
+                                if name.trim().is_empty() {
+                                    let _ = reply.send(Err(ClientError(
+                                        "Display name cannot be empty.".into(),
+                                    )));
+                                    continue;
+                                }
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                let me_slot = me_cache.clone();
+                                tokio::spawn(async move {
+                                    let result = set_display_name(&client, &name).await;
+                                    if let Ok(fresh) = &result {
+                                        *me_slot.write().unwrap_or_else(|e| e.into_inner()) =
+                                            Some(fresh.clone());
+                                    }
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Command::SetAvatar { path, reply } => {
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                let me_slot = me_cache.clone();
+                                tokio::spawn(async move {
+                                    let result = set_avatar(&client, &path).await;
+                                    if let Ok(fresh) = &result {
+                                        *me_slot.write().unwrap_or_else(|e| e.into_inner()) =
+                                            Some(fresh.clone());
+                                    }
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Command::RenameDevice {
+                                device_id,
+                                name,
+                                reply,
+                            } => {
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                tokio::spawn(async move {
+                                    let device_id =
+                                        matrix_sdk::ruma::OwnedDeviceId::from(device_id);
+                                    let result = client
+                                        .rename_device(&device_id, &name)
+                                        .await
+                                        .map(|_| ())
+                                        .map_err(|_| {
+                                            ClientError("Could not rename that session.".into())
+                                        });
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Command::DeleteDevice {
+                                device_id,
+                                password,
+                                reply,
+                            } => {
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                // Deleting the current device is refused —
+                                // that's logout's job (UI blocks it too; the
+                                // backend guard keeps other callers honest).
+                                if Some(&device_id)
+                                    == client.device_id().map(|d| d.to_string()).as_ref()
+                                {
+                                    let _ = reply.send(Err(ClientError(
+                                        "Sign out instead of deleting this session.".into(),
+                                    )));
+                                    continue;
+                                }
+                                tokio::spawn(async move {
+                                    let result = crate::uiaa::delete_device_with_password(
+                                        &client, device_id, password,
+                                    )
+                                    .await;
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Command::NotificationRules { reply } => {
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                tokio::spawn(async move {
+                                    let result = notification_toggles(&client).await;
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Command::SetNotificationRule {
+                                toggle_id,
+                                enabled,
+                                reply,
+                            } => {
+                                let Some(client) = sdk_client.clone() else {
+                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    continue;
+                                };
+                                tokio::spawn(async move {
+                                    let result =
+                                        set_notification_toggle(&client, &toggle_id, enabled).await;
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Command::GetPrefs { reply } => {
+                                // Local file, cheap: answered inline.
+                                let _ = reply.send(session::load_prefs());
+                            }
+                            Command::SetPrefs { prefs, reply } => {
+                                let _ = reply.send(session::save_prefs(&prefs));
+                            }
                         }
                     }
                 });
@@ -856,6 +1191,43 @@ mod tests {
             "unexpected error text: {}",
             err.0
         );
+        drop(tx);
+        runtime.join().expect("runtime thread exits cleanly");
+        drop(_guard);
+        std::env::remove_var("VESPER_DATA_DIR");
+    }
+
+    // Checkpoint 10: prefs commands round-trip through the runtime loop and
+    // land in the data dir (the runtime answers them inline; no login needed
+    // because prefs are device-local, not session-bound).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prefs_round_trip_through_runtime() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::session::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("VESPER_DATA_DIR", tmp.path());
+
+        let (runtime, tx) = ClientRuntime::spawn();
+        let fresh = crate::model::Prefs {
+            theme: "light".into(),
+            typing_indicators: false,
+            ..Default::default()
+        };
+        let (set_tx, set_rx) = oneshot::channel();
+        tx.send(Command::SetPrefs {
+            prefs: fresh.clone(),
+            reply: set_tx,
+        })
+        .expect("send set prefs");
+        set_rx.await.expect("set reply").expect("set ok");
+
+        let (get_tx, get_rx) = oneshot::channel();
+        tx.send(Command::GetPrefs { reply: get_tx })
+            .expect("send get prefs");
+        let loaded = get_rx.await.expect("get reply");
+        assert_eq!(loaded, fresh);
+
         drop(tx);
         runtime.join().expect("runtime thread exits cleanly");
         drop(_guard);

@@ -3,9 +3,13 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use crate::chat::VerifyDialog;
-use crate::data::{ClientState, Device, Me, VerificationAction, VerificationTarget, VesperClient};
+use crate::data::{
+    ClientState, Device, Me, NotifToggle, Prefs, VerificationAction, VerificationTarget,
+    VesperClient,
+};
 use crate::design_system::{
-    Avatar, Button, ButtonSize, ButtonVariant, SelectOption, SidebarNav, SidebarNavItem, Switch,
+    Avatar, Button, ButtonSize, ButtonVariant, Dialog, Input, SelectOption, SidebarNav,
+    SidebarNavItem, Switch,
 };
 use crate::icons::{Icon, IconName};
 use crate::window_chrome::{DragStrip, WindowControls};
@@ -47,32 +51,99 @@ const TABS: [SettingsTab; 3] = [
     SettingsTab::Security,
 ];
 
+/// What the Security tab's dialog is asking for, if anything. One modal at
+/// a time (same policy as the verify dialog).
+#[derive(Clone, PartialEq)]
+enum SecurityDialog {
+    /// Rename `device_id` (pre-filled with `current` name).
+    Rename { device_id: String, name: String },
+    /// Delete `device_id`; needs the account password (UIAA).
+    Delete { device_id: String },
+}
+
 #[component]
 pub fn SettingsScreen(
     on_close: EventHandler<()>,
     #[props(default = false)] is_mobile: bool,
 ) -> Element {
     let client = use_context::<Rc<dyn VesperClient>>();
-    let mut notif = use_signal(|| true);
-    let mut receipts = use_signal(|| true);
-    let mut typing_indicators = use_signal(|| true);
     let mut tab = use_signal(|| SettingsTab::General);
     let mut verify_id = use_signal(|| Option::<String>::None);
     let sync = use_context::<ClientState>();
 
-    let me = {
+    // Account identity. Read from the root signal (source of truth) with the
+    // one-shot `me()` as the bootstrap fallback.
+    let me_resource = {
         let client = client.clone();
         use_resource(move || {
             let client = client.clone();
             async move { client.me().await }
         })
     };
+    let identity = use_context::<Signal<Option<Me>>>();
+    let me = identity().or_else(|| me_resource().flatten());
+    let (me_name, me_id, me_avatar) = match &me {
+        Some(m) => (m.name.clone(), m.id.clone(), m.avatar.clone()),
+        None => (String::new(), String::new(), None),
+    };
+
+    // Display-name editor state (General tab). Seeded once from the current
+    // name at first render — never rewritten after that, so clearing the
+    // field to retype works (an empty draft stays empty until typed).
+    let mut name_draft = use_signal(|| me_name.clone());
+    let mut name_saving = use_signal(|| false);
+    let mut name_error = use_signal(|| None::<String>);
+    let name_dirty = name_draft() != me_name;
+
+    // Local prefs (theme + the receipt/typing opt-outs). One resource, one
+    // editable copy; saves rewrite the resource's backing file.
+    let mut prefs = use_signal(Prefs::default);
+    let prefs_resource = {
+        let client = client.clone();
+        use_resource(move || {
+            let client = client.clone();
+            async move { client.prefs().await }
+        })
+    };
+    use_effect(move || {
+        // Copy resource→local whenever the fetch lands. The effect must NOT
+        // read `prefs` itself: local edits (switches, theme select) write it,
+        // and an effect that reads the signal it writes re-runs on every edit
+        // and stomps the edit with the stale fetched value (checkpoint-06
+        // effect-loop lesson; bit the notif toggles in review). Unconditional
+        // copy on resource change is safe: the effect only re-runs when the
+        // resource state changes, never on local writes.
+        if let Some(loaded) = prefs_resource() {
+            prefs.set(loaded);
+        }
+    });
+
+    // Server push-rule toggles (Notifications tab).
+    let mut notif = use_signal(Vec::<NotifToggle>::new);
+    let mut notif_error = use_signal(|| Option::<String>::None);
+    let notif_resource = {
+        let client = client.clone();
+        use_resource(move || {
+            let client = client.clone();
+            async move { client.notification_rules().await }
+        })
+    };
+    use_effect(move || {
+        // Same copy-on-resource-change pattern as prefs above: never read
+        // `notif` here, or optimistic toggle writes get reverted by the
+        // stale resource value one effect-run later (the "flicks back on"
+        // bug). Re-runs only when the resource changes.
+        if let Some(Ok(list)) = notif_resource() {
+            notif.set(list);
+        }
+    });
+
+    // Sessions (Security tab). Reading the verification signal inside the
+    // future re-subscribes the resource: when a session completes
+    // (Done/Cancelled) the device list refetches and the just-verified badge
+    // appears without a manual refresh.
     let devices_resource = {
         let client = client.clone();
-        // Reading the verification signal inside the future re-subscribes the
-        // resource: when a session completes (Done/Cancelled) the device list
-        // refetches and the just-verified badge appears without a manual
-        // refresh.
         use_resource(move || {
             let client = client.clone();
             let session_state = sync.verification.read().as_ref().map(|s| s.state.clone());
@@ -90,8 +161,7 @@ pub fn SettingsScreen(
     });
 
     // Verify button starts a backend session; the dialog renders whatever
-    // the backend publishes into `sync.verification` (mock: instant emojis;
-    // matrix: Requested → EmojisShown as the other side accepts).
+    // the backend publishes into `sync.verification`.
     let start_verify = {
         let client = client.clone();
         move |id: String| {
@@ -102,7 +172,60 @@ pub fn SettingsScreen(
         }
     };
 
-    // Clone for the logout handler without moving `client` (still used below).
+    // Security-tab modal state (rename / delete-with-password).
+    let mut dialog = use_signal(|| Option::<SecurityDialog>::None);
+    let mut dialog_field = use_signal(String::new);
+    let mut dialog_error = use_signal(|| Option::<String>::None);
+    let mut dialog_busy = use_signal(|| false);
+
+    // Save the display name: optimistic busy state, identity signal rewrite
+    // on success so the whole shell repaints.
+    let save_name = {
+        let client = client.clone();
+        move |name: String| {
+            let client = client.clone();
+            spawn(async move {
+                name_saving.set(true);
+                name_error.set(None);
+                match client.set_display_name(name).await {
+                    Ok(fresh) => {
+                        use_context::<Signal<Option<Me>>>().set(Some(fresh));
+                    }
+                    Err(e) => name_error.set(Some(e.0)),
+                }
+                name_saving.set(false);
+            });
+        }
+    };
+
+    // Avatar upload: the file dialog runs inside a spawned task (never in
+    // the event callback — macOS nested-pump crash, see docs/07 notes).
+    let change_avatar = {
+        let client = client.clone();
+        move |_| {
+            let client = client.clone();
+            spawn(async move {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"])
+                        .set_title("Choose an avatar")
+                        .pick_file()
+                    else {
+                        return;
+                    };
+                    match client.set_avatar(path.display().to_string()).await {
+                        Ok(fresh) => {
+                            use_context::<Signal<Option<Me>>>().set(Some(fresh));
+                        }
+                        Err(e) => name_error.set(Some(e.0)),
+                    }
+                }
+            });
+        }
+    };
+
+    // Clone for the logout handler without moving `client`.
     let logout_client = client.clone();
 
     rsx! {
@@ -152,17 +275,50 @@ pub fn SettingsScreen(
                         }
                         if tab() == SettingsTab::General {
                             div { style: "display:flex;align-items:center;gap:12px;",
-                                Avatar { name: "You", size: 56 }
+                                Avatar { name: me_name.clone(), size: 56, mxc: me_avatar.clone() }
                                 div {
-                                    div { style: "font-weight:700;font-size:16px;", "You" }
-                                    div { style: "font-size:12px;color:var(--text-tertiary);font-family:var(--font-mono);",
-                                        "{me().flatten().map(|m| m.id).unwrap_or_default()}"
-                                    }
+                                    div { style: "font-weight:700;font-size:16px;", "{me_name}" }
+                                    div { style: "font-size:12px;color:var(--text-tertiary);font-family:var(--font-mono);", "{me_id}" }
+                                }
+                                Button { variant: ButtonVariant::Secondary, size: ButtonSize::Sm, onclick: change_avatar, "Change avatar" }
+                            }
+                            Input {
+                                label: "Display name".to_string(),
+                                value: name_draft(),
+                                on_change: move |v: String| name_draft.set(v),
+                                error: name_error(),
+                            }
+                            div { style: "display:flex;justify-content:flex-end;",
+                                Button {
+                                    variant: ButtonVariant::Primary,
+                                    size: ButtonSize::Sm,
+                                    disabled: name_saving()
+                                        || !name_dirty
+                                        || name_draft().trim().is_empty(),
+                                    onclick: move |_| {
+                                        let name = name_draft();
+                                        save_name(name);
+                                    },
+                                    if name_saving() { "Saving…" } else { "Save name" }
                                 }
                             }
                             crate::design_system::Select {
                                 label: "Theme",
-                                value: "dark",
+                                value: prefs().theme.clone(),
+                                on_change: {
+                                    let client = client.clone();
+                                    move |theme: String| {
+                                        let client = client.clone();
+                                        let mut next = prefs();
+                                        next.theme = theme;
+                                        prefs.set(next.clone());
+                                        spawn(async move {
+                                            if let Err(e) = client.set_prefs(next).await {
+                                                tracing::warn!("prefs save failed: {e}");
+                                            }
+                                        });
+                                    }
+                                },
                                 options: vec![
                                     SelectOption { value: "dark".into(), label: "Dark".into() },
                                     SelectOption { value: "light".into(), label: "Light".into() },
@@ -178,8 +334,6 @@ pub fn SettingsScreen(
                                             if let Err(e) = client.logout().await {
                                                 tracing::warn!("logout failed: {e}");
                                             }
-                                            // Clearing the identity signal drops the router
-                                            // back to LoginScreen regardless of backend.
                                             use_context::<Signal<Option<Me>>>().set(None);
                                         });
                                     },
@@ -189,9 +343,86 @@ pub fn SettingsScreen(
                             }
                         }
                         if tab() == SettingsTab::Notifications {
-                            Switch { label: "Notifications".to_string(), checked: notif(), on_change: move |_| notif.set(!notif()) }
-                            Switch { label: "Read receipts".to_string(), checked: receipts(), on_change: move |_| receipts.set(!receipts()) }
-                            Switch { label: "Typing indicators".to_string(), checked: typing_indicators(), on_change: move |_| typing_indicators.set(!typing_indicators()) }
+                            for toggle in notif().iter() {
+                                {
+                                    let id = toggle.id.clone();
+                                    let enabled = toggle.enabled;
+                                    let client = client.clone();
+                                    rsx! {
+                                        div { key: "{id}", style: "display:flex;align-items:center;justify-content:space-between;gap:10px;",
+                                            Switch {
+                                                label: toggle.label.clone(),
+                                                checked: enabled,
+                                                on_change: move |_| {
+                                                    let client = client.clone();
+                                                    notif_error.set(None);
+                                                    // Optimistic flip; the result
+                                                    // list replaces state wholesale.
+                                                    let mut optimistic = notif();
+                                                    if let Some(t) = optimistic.iter_mut().find(|t| t.id == id) {
+                                                        t.enabled = !t.enabled;
+                                                    }
+                                                    notif.set(optimistic);
+                                                    let tid = id.clone();
+                                                    let next = !enabled;
+                                                    spawn(async move {
+                                                        match client.set_notification_rule(tid, next).await {
+                                                            Ok(list) => notif.set(list),
+                                                            Err(e) => {
+                                                                notif_error.set(Some(e.0));
+                                                                // Refetch to restore truth.
+                                                                if let Ok(list) = client.notification_rules().await {
+                                                                    notif.set(list);
+                                                                }
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(err) = notif_error() {
+                                div { style: "font-size:12px;color:var(--status-away);", "{err}" }
+                            }
+                            div { style: "font-size:13px;font-weight:700;letter-spacing:0.04em;color:var(--text-tertiary);margin-top:8px;", "PRIVACY" }
+                            Switch {
+                                label: "Read receipts".to_string(),
+                                checked: prefs().read_receipts,
+                                on_change: {
+                                    let client = client.clone();
+                                    move |_| {
+                                        let client = client.clone();
+                                        let mut next = prefs();
+                                        next.read_receipts = !next.read_receipts;
+                                        prefs.set(next.clone());
+                                        spawn(async move {
+                                            if let Err(e) = client.set_prefs(next).await {
+                                                tracing::warn!("prefs save failed: {e}");
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                            Switch {
+                                label: "Typing indicators".to_string(),
+                                checked: prefs().typing_indicators,
+                                on_change: {
+                                    let client = client.clone();
+                                    move |_| {
+                                        let client = client.clone();
+                                        let mut next = prefs();
+                                        next.typing_indicators = !next.typing_indicators;
+                                        prefs.set(next.clone());
+                                        spawn(async move {
+                                            if let Err(e) = client.set_prefs(next).await {
+                                                tracing::warn!("prefs save failed: {e}");
+                                            }
+                                        });
+                                    }
+                                }
+                            }
                         }
                         if tab() == SettingsTab::Security {
                             div { style: "font-size:13px;font-weight:700;letter-spacing:0.04em;color:var(--text-tertiary);", "SESSIONS" }
@@ -199,6 +430,23 @@ pub fn SettingsScreen(
                                 {
                                     let id = d.id.clone();
                                     let start_verify = start_verify.clone();
+                                    let open_rename = {
+                                        let name = d.name.clone();
+                                        let id = id.clone();
+                                        move |_| {
+                                            dialog.set(Some(SecurityDialog::Rename { device_id: id.clone(), name: name.clone() }));
+                                            dialog_field.set(name.clone());
+                                            dialog_error.set(None);
+                                        }
+                                    };
+                                    let open_delete = {
+                                        let id = id.clone();
+                                        move |_| {
+                                            dialog.set(Some(SecurityDialog::Delete { device_id: id.clone() }));
+                                            dialog_field.set(String::new());
+                                            dialog_error.set(None);
+                                        }
+                                    };
                                     rsx! {
                                         div { key: "{d.id}", style: "display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-md);",
                                             Icon {
@@ -207,14 +455,28 @@ pub fn SettingsScreen(
                                                 color: if d.verified { "var(--status-online)".to_string() } else { "var(--status-away)".to_string() },
                                             }
                                             div { style: "flex:1;",
-                                                div { style: "font-size:14px;font-weight:600;", "{d.name}" }
+                                                div { style: "font-size:14px;font-weight:600;display:flex;gap:6px;align-items:center;",
+                                                    "{d.name}"
+                                                    if d.current {
+                                                        span { style: "font-size:11px;font-weight:700;color:var(--text-brand);", "THIS DEVICE" }
+                                                    }
+                                                }
                                                 div { style: "font-size:12px;color:var(--text-tertiary);", "{d.last_seen}" }
                                             }
                                             if !d.verified {
-                                                Button { variant: ButtonVariant::Secondary, size: ButtonSize::Sm, onclick: move |_| {
-                                                    verify_id.set(Some(id.clone()));
-                                                    start_verify(id.clone());
+                                                Button { variant: ButtonVariant::Secondary, size: ButtonSize::Sm, onclick: {
+                                                    let id = id.clone();
+                                                    move |_| {
+                                                        verify_id.set(Some(id.clone()));
+                                                        start_verify(id.clone());
+                                                    }
                                                 }, "Verify" }
+                                            }
+                                            Button { variant: ButtonVariant::Secondary, size: ButtonSize::Sm, onclick: open_rename, "Rename" }
+                                            if d.current {
+                                                span { style: "font-size:11px;color:var(--text-tertiary);", "Use Sign out" }
+                                            } else {
+                                                Button { variant: ButtonVariant::Danger, size: ButtonSize::Sm, onclick: open_delete, "Delete" }
                                             }
                                         }
                                     }
@@ -230,9 +492,6 @@ pub fn SettingsScreen(
                     let client = client.clone();
                     move |_| {
                         verify_id.set(None);
-                        // Manual close mid-session cancels it server-side; on
-                        // terminal states (Done/Cancelled) this is a no-op the
-                        // backend ignores.
                         let client = client.clone();
                         spawn(async move {
                             client.verification_action(VerificationAction::Cancel);
@@ -249,6 +508,82 @@ pub fn SettingsScreen(
                     }
                 },
             }
+
+            // Rename / delete-session modal (checkpoint 10). Reuses the
+            // dialog shell; the field is a name or the account password.
+            {dialog().map(|current| {
+                let (title, field_label, field_kind, confirm_label, danger) = match &current {
+                    SecurityDialog::Rename { .. } => {
+                        ("Rename session".to_string(), "Name".to_string(), "text".to_string(), "Rename".to_string(), false)
+                    }
+                    SecurityDialog::Delete { .. } => {
+                        ("Delete session".to_string(), "Account password".to_string(), "password".to_string(), "Delete session".to_string(), true)
+                    }
+                };
+                let device_id = match &current {
+                    SecurityDialog::Rename { device_id, .. } | SecurityDialog::Delete { device_id } => device_id.clone(),
+                };
+                let confirm_variant = if danger { ButtonVariant::Danger } else { ButtonVariant::Primary };
+                rsx! {
+                    Dialog {
+                        title,
+                        open: true,
+                        onclose: move |_| dialog.set(None),
+                        actions: rsx! {
+                            Button { variant: ButtonVariant::Secondary, size: ButtonSize::Sm, onclick: move |_| dialog.set(None), "Cancel" }
+                            Button {
+                                variant: confirm_variant,
+                                size: ButtonSize::Sm,
+                                disabled: dialog_busy() || dialog_field().trim().is_empty(),
+                                onclick: {
+                                    let client = client.clone();
+                                    let current = current.clone();
+                                    let device_id = device_id.clone();
+                                    move |_| {
+                                        let client = client.clone();
+                                        let value = dialog_field();
+                                        let device_id = device_id.clone();
+                                        let action = current.clone();
+                                        dialog_busy.set(true);
+                                        dialog_error.set(None);
+                                        spawn(async move {
+                                            let result = match action {
+                                                SecurityDialog::Rename { .. } => {
+                                                    client.rename_device(device_id, value).await
+                                                }
+                                                SecurityDialog::Delete { .. } => {
+                                                    client.delete_device(device_id, value).await
+                                                }
+                                            };
+                                            match result {
+                                                Ok(()) => {
+                                                    dialog.set(None);
+                                                    // Refetch so the row reflects the change.
+                                                    let list = client.devices().await;
+                                                    devices.set(list);
+                                                }
+                                                Err(e) => dialog_error.set(Some(e.0)),
+                                            }
+                                            dialog_busy.set(false);
+                                        });
+                                    }
+                                },
+                                if dialog_busy() { "Working…" } else { "{confirm_label}" }
+                            }
+                        },
+                        if matches!(current, SecurityDialog::Delete { .. }) {
+                            div { style: "margin-bottom:14px;", "Deleting a session signs it out everywhere. This cannot be undone." }
+                        }
+                        Input {
+                            label: field_label,
+                            input_type: field_kind,
+                            value: dialog_field(),
+                            on_change: move |v: String| dialog_field.set(v),
+                            error: dialog_error(),
+                        }
+                    }
+                }
+            })}
         }
     }
 }

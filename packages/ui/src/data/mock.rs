@@ -19,6 +19,8 @@ struct MockState {
     devices: Vec<Device>,
     public_rooms: Vec<PublicRoom>,
     public_spaces: Vec<PublicSpace>,
+    notif: Vec<NotifToggle>,
+    prefs: Prefs,
     next_id: u64,
 }
 
@@ -430,20 +432,28 @@ impl Default for MockClient {
                 name: "Vesper · macOS".into(),
                 last_seen: "active now".into(),
                 verified: true,
+                current: true,
             },
             Device {
                 id: "d2".into(),
                 name: "Vesper · iOS".into(),
                 last_seen: "2h ago".into(),
                 verified: false,
+                current: false,
             },
             Device {
                 id: "d3".into(),
                 name: "Element · Web".into(),
                 last_seen: "3d ago".into(),
                 verified: true,
+                current: false,
             },
         ];
+
+        // Checkpoint 10: notification toggles + prefs seeded from the rule
+        // table defaults, so the settings tabs render real shapes offline.
+        let notif = client::notifications::default_toggles();
+        let prefs = Prefs::default();
 
         // Directory fixtures (checkpoint 09): enough rows to overflow
         // [`MOCK_PAGE_SIZE`] so "load more" has something to load. Joining
@@ -543,6 +553,8 @@ impl Default for MockClient {
                 devices,
                 public_rooms,
                 public_spaces,
+                notif,
+                prefs,
                 next_id: 1,
             }),
             bound: RefCell::new(None),
@@ -742,6 +754,79 @@ impl VesperClient for MockClient {
 
     async fn devices(&self) -> Vec<Device> {
         self.state.borrow().devices.clone()
+    }
+
+    // Checkpoint 10: in-memory account console so the settings tabs stay
+    // demoable offline. Profile saves rewrite `state.me` — `me()` clones it,
+    // so callers (nav footer, settings header) repaint.
+    async fn set_display_name(&self, name: String) -> Result<Me, ClientError> {
+        if name.trim().is_empty() {
+            return Err(ClientError("Display name cannot be empty.".into()));
+        }
+        let mut state = self.state.borrow_mut();
+        state.me.name = name;
+        Ok(state.me.clone())
+    }
+
+    async fn set_avatar(&self, _path: String) -> Result<Me, ClientError> {
+        // The mock has no media backend: mint a fresh fake avatar id so the
+        // "changed" state is observable (initials swap is the visible effect
+        // since nothing resolves mock:// urls).
+        let mut state = self.state.borrow_mut();
+        let n = state.next_id;
+        state.next_id += 1;
+        state.me.avatar = Some(format!("mock://avatar-{n}"));
+        Ok(state.me.clone())
+    }
+
+    async fn rename_device(&self, device_id: String, name: String) -> Result<(), ClientError> {
+        let mut state = self.state.borrow_mut();
+        let Some(device) = state.devices.iter_mut().find(|d| d.id == device_id) else {
+            return Err(ClientError("No such session.".into()));
+        };
+        device.name = name;
+        Ok(())
+    }
+
+    async fn delete_device(&self, device_id: String, _password: String) -> Result<(), ClientError> {
+        let mut state = self.state.borrow_mut();
+        if state.devices.iter().any(|d| d.id == device_id && d.current) {
+            return Err(ClientError(
+                "Sign out instead of deleting this session.".into(),
+            ));
+        }
+        let before = state.devices.len();
+        state.devices.retain(|d| d.id != device_id);
+        if state.devices.len() == before {
+            return Err(ClientError("No such session.".into()));
+        }
+        Ok(())
+    }
+
+    async fn notification_rules(&self) -> Result<Vec<NotifToggle>, ClientError> {
+        Ok(self.state.borrow().notif.clone())
+    }
+
+    async fn set_notification_rule(
+        &self,
+        toggle_id: String,
+        enabled: bool,
+    ) -> Result<Vec<NotifToggle>, ClientError> {
+        let mut state = self.state.borrow_mut();
+        let Some(toggle) = state.notif.iter_mut().find(|t| t.id == toggle_id) else {
+            return Err(ClientError("Unknown notification setting.".into()));
+        };
+        toggle.enabled = enabled;
+        Ok(state.notif.clone())
+    }
+
+    async fn prefs(&self) -> Prefs {
+        self.state.borrow().prefs.clone()
+    }
+
+    async fn set_prefs(&self, prefs: Prefs) -> Result<(), ClientError> {
+        self.state.borrow_mut().prefs = prefs;
+        Ok(())
     }
 
     // Checkpoint 08: scripted happy-path session. `EmojisShown` immediately

@@ -9,6 +9,10 @@
 #![recursion_limit = "512"]
 pub mod api;
 pub mod model;
+pub mod notifications;
+
+#[cfg(feature = "matrix")]
+pub mod uiaa;
 
 #[cfg(feature = "matrix")]
 pub mod directory;
@@ -375,6 +379,63 @@ mod matrix_impl {
                 reply,
             })
             .await
+        }
+
+        // Checkpoint 10: account console. Straight command round-trips;
+        // profile saves refresh the runtime's identity slot themselves.
+        async fn set_display_name(&self, name: String) -> Result<Me, ClientError> {
+            self.ask(move |reply| Command::SetDisplayName { name, reply })
+                .await
+        }
+        async fn set_avatar(&self, path: String) -> Result<Me, ClientError> {
+            self.ask(move |reply| Command::SetAvatar { path, reply })
+                .await
+        }
+        async fn rename_device(&self, device_id: String, name: String) -> Result<(), ClientError> {
+            self.ask(move |reply| Command::RenameDevice {
+                device_id,
+                name,
+                reply,
+            })
+            .await
+        }
+        async fn delete_device(
+            &self,
+            device_id: String,
+            password: String,
+        ) -> Result<(), ClientError> {
+            self.ask(move |reply| Command::DeleteDevice {
+                device_id,
+                password,
+                reply,
+            })
+            .await
+        }
+        async fn notification_rules(&self) -> Result<Vec<NotifToggle>, ClientError> {
+            self.ask(|reply| Command::NotificationRules { reply }).await
+        }
+        async fn set_notification_rule(
+            &self,
+            toggle_id: String,
+            enabled: bool,
+        ) -> Result<Vec<NotifToggle>, ClientError> {
+            self.ask(move |reply| Command::SetNotificationRule {
+                toggle_id,
+                enabled,
+                reply,
+            })
+            .await
+        }
+        async fn prefs(&self) -> Prefs {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            match self.tx.send(Command::GetPrefs { reply: reply_tx }) {
+                Ok(()) => reply_rx.await.unwrap_or_default(),
+                Err(_) => Prefs::default(),
+            }
+        }
+        async fn set_prefs(&self, prefs: Prefs) -> Result<(), ClientError> {
+            self.ask(move |reply| Command::SetPrefs { prefs, reply })
+                .await
         }
     }
 }

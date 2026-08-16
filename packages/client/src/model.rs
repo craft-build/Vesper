@@ -214,6 +214,64 @@ pub struct Device {
     pub name: String,
     pub last_seen: String,
     pub verified: bool,
+    /// True when this is the signed-in session's own device (checkpoint 10):
+    /// the settings UI tags it and blocks deletion in favor of Log out.
+    pub current: bool,
+}
+
+/// One server-side notification push rule surfaced as a settings toggle
+/// (checkpoint 10). `id` is the toggle key of the client crate's rule table
+/// (see `notifications::RULE_TABLE`), not the raw Matrix rule id — some
+/// toggles ("direct messages") map to more than one rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifToggle {
+    pub id: String,
+    pub label: String,
+    pub enabled: bool,
+}
+
+/// Device-local application preferences (checkpoint 10), persisted as a
+/// versioned `prefs.json` in the OS data dir. Serde derives exist only under
+/// the `matrix` feature (the crate otherwise stays dependency-free for the
+/// wasm `ui` build); `#[serde(default)]` everywhere so files written by newer
+/// versions (unknown fields) or older ones (missing fields) never fail to
+/// load — unknown fields are ignored by serde, missing ones fall back to
+/// [`Prefs::default`].
+#[cfg_attr(feature = "matrix", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prefs {
+    /// File-format version; bumped when the shape changes incompatibly.
+    #[cfg_attr(feature = "matrix", serde(default = "prefs_version"))]
+    pub version: u8,
+    #[cfg_attr(feature = "matrix", serde(default = "default_theme"))]
+    pub theme: String,
+    #[cfg_attr(feature = "matrix", serde(default = "default_true"))]
+    pub read_receipts: bool,
+    #[cfg_attr(feature = "matrix", serde(default = "default_true"))]
+    pub typing_indicators: bool,
+}
+
+fn prefs_version() -> u8 {
+    1
+}
+
+fn default_theme() -> String {
+    "dark".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            version: prefs_version(),
+            theme: default_theme(),
+            read_receipts: default_true(),
+            typing_indicators: default_true(),
+        }
+    }
 }
 
 /// Who an interactive verification session runs against (checkpoint 08).
