@@ -1,8 +1,10 @@
+use std::rc::Rc;
+
 use dioxus::document;
 use dioxus::prelude::*;
 
 use crate::chat::{AppShell, ChatUiState, ChatView, DiscoveryModal};
-use crate::data::{self, ClientState, Convo, Me};
+use crate::data::{self, ClientState, Convo, Me, VesperClient};
 use crate::design_system::ToastCenter;
 use crate::screens::{LoginScreen, SettingsScreen};
 
@@ -254,8 +256,50 @@ fn Shell() -> Element {
 #[component]
 fn Home() -> Element {
     track_screen(Screen::Home);
-    rsx! {
-        ChatView {}
+    let mut ui = use_context::<ChatUiState>();
+    let client = use_context::<Rc<dyn VesperClient>>();
+    let navigator = use_navigator();
+    // Launch restore ("remember my last room"): reopen the room that was
+    // open when the app last ran. One-shot per app run — the guard lives
+    // in App-scoped `ChatUiState`, so later visits to Home (leaving a
+    // room, backing out of settings) never yank the user elsewhere.
+    // `replace` keeps "/" out of history, so going back from the restored
+    // room doesn't bounce into an auto-redirecting Home.
+    let last_room = use_resource({
+        let client = client.clone();
+        move || {
+            let client = client.clone();
+            async move { client.prefs().await.last_open_room }
+        }
+    });
+    use_effect(move || {
+        if (ui.room_restore_done)() {
+            return;
+        }
+        // `Some` once prefs have loaded: `None` = still fetching, try
+        // again next run (no signal writes here, so no loop).
+        let Some(saved) = last_room.read().clone() else {
+            return;
+        };
+        ui.room_restore_done.set(true);
+        if let Some(id) = saved {
+            if !id.is_empty() {
+                navigator.replace(Route::RoomView { room_id: id });
+            }
+        }
+    });
+    // Hold ChatView back until the restore decision lands: mounting it
+    // early would flash the fallback first room (and churn a timeline
+    // open/close) only to swap a frame later.
+    let restore_decided = (ui.room_restore_done)() || last_room.read().is_some();
+    if restore_decided {
+        rsx! {
+            ChatView {}
+        }
+    } else {
+        rsx! {
+            // Held for the restore decision (see above): nothing to paint.
+        }
     }
 }
 
@@ -274,7 +318,20 @@ fn SettingsPage() -> Element {
     let navigator = use_navigator();
     track_screen(Screen::Settings);
     rsx! {
-        SettingsScreen { on_close: move |_| { navigator.push(Route::Home {}); } }
+        SettingsScreen {
+            on_close: move |_| {
+                // Back out to wherever settings was opened from — the room
+                // the user was reading, or Home — instead of always landing
+                // on Home. A /settings URL with no history behind it (fresh
+                // web deep link) falls back to Home; go_back alone would
+                // strand the user on the settings screen.
+                if navigator.can_go_back() {
+                    navigator.go_back();
+                } else {
+                    navigator.push(Route::Home {});
+                }
+            }
+        }
     }
 }
 

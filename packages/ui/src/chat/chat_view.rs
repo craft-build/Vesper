@@ -165,9 +165,23 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
     let leave_room = {
         let client = client.clone();
         let active_id = active_id.clone();
+        let navigator = navigator.clone();
         move |id: String| {
             if active_id == id {
                 navigator.push(Route::Home {});
+                // Leaving the open room forgets it, so the next launch's
+                // restore doesn't reopen a room we're no longer in.
+                let client = client.clone();
+                let left = id.clone();
+                spawn(async move {
+                    let mut prefs = client.prefs().await;
+                    if prefs.last_open_room.as_deref() == Some(left.as_str()) {
+                        prefs.last_open_room = None;
+                        if let Err(e) = client.set_prefs(prefs).await {
+                            tracing::warn!("could not forget last open room: {e}");
+                        }
+                    }
+                });
             }
             let client = client.clone();
             spawn(async move {
@@ -201,6 +215,36 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
             if active_room.read().as_deref() == Some(active_id.as_str()) {
                 active_room.set(None);
             }
+        }
+    });
+    // Remember the open room for the next launch ("remember my last
+    // room"): persist it to the device-local prefs whenever it moves.
+    // `sync.active_room` is read here (not captured `active_id`) because
+    // it's the one signal that tracks route-driven room changes — the
+    // effect re-runs exactly when the open room does. Its unmount clear
+    // (`None`, e.g. while sitting in settings) skips the save instead of
+    // erasing the memory. Same-value writes short-circuit; a failed save
+    // is a warn, never a UI error.
+    use_effect({
+        let client = client.clone();
+        move || {
+            let Some(id) = sync.active_room.read().clone() else {
+                return;
+            };
+            if id.is_empty() {
+                return;
+            }
+            let client = client.clone();
+            spawn(async move {
+                let mut prefs = client.prefs().await;
+                if prefs.last_open_room.as_deref() == Some(id.as_str()) {
+                    return;
+                }
+                prefs.last_open_room = Some(id);
+                if let Err(e) = client.set_prefs(prefs).await {
+                    tracing::warn!("could not save last open room: {e}");
+                }
+            });
         }
     });
 

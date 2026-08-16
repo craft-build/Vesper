@@ -53,7 +53,10 @@ preferences, and full logout (incl. token invalidation).
   (table of rule ids → toggle), unit-tested.
 - **Prefs versioning**: local prefs file `prefs.json` versioned
   (`{ version: 1, ... }`), tolerant serde defaults so future fields don't
-  break old installs.
+  break old installs. Later addition: `last_open_room` — the open room is
+  persisted on every room change and restored once per app run on launch
+  (Home redirects to it, `replace` so history stays clean); closing
+  settings goes back to the route it was opened from, not always Home.
 - All trait additions get MockClient implementations backed by the mock's
   in-memory state so settings UI remains demoable offline.
 

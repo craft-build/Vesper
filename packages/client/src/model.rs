@@ -249,6 +249,12 @@ pub struct Prefs {
     pub read_receipts: bool,
     #[cfg_attr(feature = "matrix", serde(default = "default_true"))]
     pub typing_indicators: bool,
+    /// The room that was open when the app last ran, restored on launch
+    /// ("remember my last room"). Device-local, not per-account: an id the
+    /// signed-in account can't see (left from elsewhere, another account)
+    /// just renders the empty state.
+    #[cfg_attr(feature = "matrix", serde(default))]
+    pub last_open_room: Option<String>,
 }
 
 fn prefs_version() -> u8 {
@@ -270,6 +276,7 @@ impl Default for Prefs {
             theme: default_theme(),
             read_receipts: default_true(),
             typing_indicators: default_true(),
+            last_open_room: None,
         }
     }
 }

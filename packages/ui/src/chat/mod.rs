@@ -53,6 +53,11 @@ pub struct ChatUiState {
     pub nav_open: Signal<bool>,
     pub switcher_open: Signal<bool>,
     pub is_mobile: Signal<bool>,
+    /// Whether the launch-time "reopen my last room" restore has already
+    /// run. App-scope one-shot guard: only the first Home of a session may
+    /// redirect (later Home visits — leaving a room, backing out of
+    /// settings — must stay put).
+    pub room_restore_done: Signal<bool>,
 }
 
 impl ChatUiState {
@@ -64,6 +69,7 @@ impl ChatUiState {
             nav_open: Signal::new(false),
             switcher_open: Signal::new(false),
             is_mobile: Signal::new(false),
+            room_restore_done: Signal::new(false),
         }
     }
 }
