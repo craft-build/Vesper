@@ -16,6 +16,7 @@ mod tabs;
 mod tag;
 mod textarea;
 mod toast;
+mod toast_center;
 mod tooltip;
 
 pub use avatar::Avatar;
@@ -36,4 +37,5 @@ pub use tabs::{TabItem, Tabs};
 pub use tag::{Tag, TagTone};
 pub use textarea::Textarea;
 pub use toast::{Toast, ToastTone};
+pub use toast_center::{ToastCenter, ToastHost};
 pub use tooltip::{Tooltip, TooltipSide};

@@ -107,3 +107,25 @@ distinction, recency ordering. No message bodies yet.
 > start sync after login/restore, add a connecting-status signal surfaced in
 > AppShell, and make nav drawer + switcher reactive to the signal. Verify
 > live updates by messaging from a second session. Keep mock mode working.
+
+## Implemented / Deviations (retrospective footer)
+
+**Implemented**: `SyncService` (MSC4186 simplified sliding sync) driving a
+`RoomListService`, `VectorDiff` stream → `Vec<Convo>` published into
+sync-storage Dioxus signals from the runtime thread, offline mode with
+"connecting…" surfaced via the `connecting` signal.
+
+**Deviations**:
+- **No local sort**: docs/03 predicted a latest-event sort; the diff API
+  in 0.18 doesn't expose timestamps per diff, so ordering is sliding
+  sync's bump order applied faithfully (documented in `sync.rs`).
+- **Diff application became O(batch) (checkpoint 11 §C).** Rows now pair
+  each `RoomListItem` with its mapped `Convo`; a batch maps only the
+  values it carries, and DM presence dots refresh via a presence-change
+  dirty set instead of full-list remaps. Original design remapped the
+  entire list every batch.
+- Invites are still not rendered (no public accessor in 0.18; unchanged
+  from the deferral noted above).
+- The signal-ownership concern (off-thread writes needing App-scope,
+  SyncStorage signals) landed exactly as the doc's "Signal ownership
+  problem" section prescribed.

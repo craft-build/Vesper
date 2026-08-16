@@ -172,7 +172,7 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
             let client = client.clone();
             spawn(async move {
                 if let Err(e) = client.leave_room(&id).await {
-                    tracing::warn!("leave_room: {}", e.0);
+                    tracing::warn!("leave_room: {}", e);
                 }
             });
         }

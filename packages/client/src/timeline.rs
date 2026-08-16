@@ -396,7 +396,7 @@ impl TimelineRegistry {
             .timeline
             .paginate_backwards(PAGE)
             .await
-            .map_err(|e| ClientError(format!("Back-pagination failed: {e}")))?;
+            .map_err(|e| ClientError::server(format!("Back-pagination failed: {e}")))?;
         // The pagination request is done, but subscriber delivery is async;
         // wait briefly for the diff to land so the returned count is honest
         // and the UI spinner can stop at the right time.
@@ -500,13 +500,13 @@ impl TimelineRegistry {
         reply_to: Option<String>,
     ) -> Result<(), ClientError> {
         let Some(entry) = self.entries.get(room_id) else {
-            return Err(ClientError("That conversation is not open.".into()));
+            return Err(ClientError::invalid("That conversation is not open."));
         };
         let content = RoomMessageEventContentWithoutRelation::text_markdown(text);
         if let Some(reply_to) = reply_to {
             let event_id = EventId::parse(&reply_to)
                 .map(|e| e.to_owned())
-                .map_err(|_| ClientError("Could not send the reply.".into()))?;
+                .map_err(|_| ClientError::network("Could not send the reply."))?;
             // `send_reply` builds the spec-shaped fallback body and mentions
             // itself, and does not return the send handle — retries of a
             // failed reply fall back to "message already sent or unknown".
@@ -516,7 +516,7 @@ impl TimelineRegistry {
                 .await
                 .map_err(|e| {
                     tracing::warn!(room_id, "reply send failed: {e}");
-                    ClientError("Could not send the reply.".into())
+                    ClientError::network("Could not send the reply.")
                 })?;
             Ok(())
         } else {
@@ -526,7 +526,7 @@ impl TimelineRegistry {
                 .await
                 .map_err(|e| {
                     tracing::warn!(room_id, "send failed: {e}");
-                    ClientError("Could not send the message.".into())
+                    ClientError::network("Could not send the message.")
                 })?;
             lock(&entry.send_handles).push(handle);
             Ok(())
@@ -543,16 +543,16 @@ impl TimelineRegistry {
         text: String,
     ) -> Result<(), ClientError> {
         let Some(entry) = self.entries.get(room_id) else {
-            return Err(ClientError("That conversation is not open.".into()));
+            return Err(ClientError::invalid("That conversation is not open."));
         };
         let root = EventId::parse(root_id)
             .map(|e| e.to_owned())
-            .map_err(|_| ClientError("Could not send the thread reply.".into()))?;
+            .map_err(|_| ClientError::network("Could not send the thread reply."))?;
         let mut content = RoomMessageEventContent::text_markdown(text);
         content.relates_to = Some(Relation::Thread(Thread::plain(root.clone(), root)));
         let handle = entry.timeline.send(content.into()).await.map_err(|e| {
             tracing::warn!(room_id, "thread reply send failed: {e}");
-            ClientError("Could not send the thread reply.".into())
+            ClientError::network("Could not send the thread reply.")
         })?;
         lock(&entry.send_handles).push(handle);
         Ok(())
@@ -570,12 +570,12 @@ impl TimelineRegistry {
         emoji: &str,
     ) -> Result<Vec<Reaction>, ClientError> {
         let Some(entry) = self.entries.get(room_id) else {
-            return Err(ClientError("That conversation is not open.".into()));
+            return Err(ClientError::invalid("That conversation is not open."));
         };
         let Ok(cid) = EventId::parse(event_id).map(|e| e.to_owned()) else {
             // Not a real event id (e.g. a `txn-` local echo) — nothing the
             // timeline can toggle a reaction on.
-            return Err(ClientError("Could not react to that message.".into()));
+            return Err(ClientError::network("Could not react to that message."));
         };
         entry
             .timeline
@@ -583,7 +583,7 @@ impl TimelineRegistry {
             .await
             .map_err(|e| {
                 tracing::warn!(room_id, "reaction toggle failed: {e}");
-                ClientError("Could not update the reaction.".into())
+                ClientError::network("Could not update the reaction.")
             })?;
         let guard = lock(&entry.inner);
         for item in &guard.items {
@@ -611,11 +611,11 @@ impl TimelineRegistry {
         root_id: &str,
     ) -> Result<Vec<ThreadReply>, ClientError> {
         let Some(entry) = self.entries.get(room_id) else {
-            return Err(ClientError("That conversation is not open.".into()));
+            return Err(ClientError::invalid("That conversation is not open."));
         };
         let root = EventId::parse(root_id)
             .map(|e| e.to_owned())
-            .map_err(|_| ClientError("Could not open that thread.".into()))?;
+            .map_err(|_| ClientError::network("Could not open that thread."))?;
         let timeline = TimelineBuilder::new(entry.timeline.room())
             .with_focus(TimelineFocus::Thread {
                 root_event_id: root,
@@ -624,7 +624,7 @@ impl TimelineRegistry {
             .await
             .map_err(|e| {
                 tracing::warn!(room_id, "thread timeline build failed: {e}");
-                ClientError("Could not open that thread.".into())
+                ClientError::network("Could not open that thread.")
             })?;
         // Backfill up to two pages of thread replies from the server so
         // pre-existing threads are actually populated, not just live ones.
@@ -650,10 +650,10 @@ impl TimelineRegistry {
     /// `unwedge`s it out of the send queue's stuck state.
     pub async fn retry_send(&self, room_id: &str, mapped_id: &str) -> Result<(), ClientError> {
         let Some(entry) = self.entries.get(room_id) else {
-            return Err(ClientError("That conversation is not open.".into()));
+            return Err(ClientError::invalid("That conversation is not open."));
         };
         let Some(txn) = txn_of(mapped_id) else {
-            return Err(ClientError("Only pending messages can be retried.".into()));
+            return Err(ClientError::invalid("Only pending messages can be retried."));
         };
         let created_at = {
             let guard = lock(&entry.inner);
@@ -669,7 +669,7 @@ impl TimelineRegistry {
             })
         };
         let Some(created_at) = created_at else {
-            return Err(ClientError("Message already sent or unknown.".into()));
+            return Err(ClientError::invalid("Message already sent or unknown."));
         };
         let handle = {
             let handles = lock(&entry.send_handles);
@@ -682,11 +682,11 @@ impl TimelineRegistry {
             }
         };
         let Some(handle) = handle else {
-            return Err(ClientError("Message already sent or unknown.".into()));
+            return Err(ClientError::invalid("Message already sent or unknown."));
         };
         handle.unwedge().await.map_err(|e| {
             tracing::warn!(room_id, "retry failed: {e}");
-            ClientError("Could not retry the message.".into())
+            ClientError::network("Could not retry the message.")
         })
     }
 
@@ -695,11 +695,11 @@ impl TimelineRegistry {
     /// the `TimelineItemHandle::Local` branch calls `SendHandle::abort`).
     pub async fn discard_send(&self, room_id: &str, mapped_id: &str) -> Result<(), ClientError> {
         let Some(entry) = self.entries.get(room_id) else {
-            return Err(ClientError("That conversation is not open.".into()));
+            return Err(ClientError::invalid("That conversation is not open."));
         };
         let Some(txn) = txn_of(mapped_id) else {
-            return Err(ClientError(
-                "Only pending messages can be discarded.".into(),
+            return Err(ClientError::invalid(
+                "Only pending messages can be discarded.",
             ));
         };
         entry
@@ -711,7 +711,7 @@ impl TimelineRegistry {
             .await
             .map_err(|e| {
                 tracing::warn!(room_id, "discard failed: {e}");
-                ClientError("Could not discard the message.".into())
+                ClientError::unknown("Could not discard the message.")
             })
     }
 }

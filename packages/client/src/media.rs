@@ -8,10 +8,12 @@
 //! inline images are resolved through the homeserver's thumbnail API at
 //! display size, and resolved URIs are memoized in `ClientState::media`.
 //!
-//! Caching: every fetch goes through `Media::get_media_content(.., true)`,
-//! which reads/writes the `SqliteMediaStore` the client builder wires up
-//! automatically — cache hits survive restarts, and MXC URIs are
-//! content-addressed so entries never go stale.
+//! Caching (checkpoint 11 §C): every fetch goes through Vesper's own
+//! on-disk LRU cache ([`crate::media_cache`], 500 MB cap) — the SDK's
+//! sqlite media store is bypassed (`use_cache = false`) because nothing
+//! in matrix-sdk 0.18 evicts it and it grows without bound. Cache hits
+//! survive restarts; MXC URIs are content-addressed so entries never go
+//! stale; the cap evicts least-recently-viewed media first.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use matrix_sdk::{
@@ -40,12 +42,12 @@ use crate::{
 /// `EncryptedFile` JSON when the piece of media is encrypted.
 fn media_source(mxc: &str, encrypted: Option<&str>) -> Result<MediaSource, ClientError> {
     let uri = OwnedMxcUri::try_from(mxc)
-        .map_err(|_| ClientError(format!("Could not use the media URI '{mxc}'.")))?;
+        .map_err(|_| ClientError::invalid(format!("Could not use the media URI '{mxc}'.")))?;
     match encrypted {
         None => Ok(MediaSource::Plain(uri)),
         Some(json) => {
             let file: EncryptedFile = serde_json::from_str(json).map_err(|e| {
-                ClientError(format!("Could not read the media encryption info: {e}"))
+                ClientError::invalid(format!("Could not read the media encryption info: {e}"))
             })?;
             Ok(MediaSource::Encrypted(Box::new(file)))
         }
@@ -61,8 +63,42 @@ async fn fetch(
     encrypted: Option<&str>,
     thumb: Option<(u32, u32)>,
 ) -> Result<Vec<u8>, ClientError> {
+    // Cache-first (checkpoint 11 §C): a hit never touches the network or
+    // the SDK store. Directory setup failure degrades to uncached fetches.
+    let key = crate::media_cache::cache_key(mxc, encrypted, thumb);
+    if let Ok(dir) = crate::media_cache::cache_dir() {
+        if let Some(bytes) = crate::media_cache::read(&dir, &key) {
+            return Ok(bytes);
+        }
+    }
+
     let source = media_source(mxc, encrypted)?;
     let err_prefix = "Could not load media";
+    let bytes = fetch_uncached(client, source, thumb, err_prefix, mxc).await?;
+
+    // Store + evict on the tokio runtime; eviction walks the cache dir.
+    if let Ok(dir) = crate::media_cache::cache_dir() {
+        crate::media_cache::write(&dir, &key, &bytes)?;
+        let cap = crate::media_cache::DEFAULT_CAP_BYTES;
+        tokio::task::spawn_blocking(move || {
+            crate::media_cache::evict_to_cap(&dir, cap);
+        })
+        .await
+        .ok();
+    }
+    Ok(bytes)
+}
+
+/// Network half: thumbnails first (falling back to full content when the
+/// server can't thumbnail the type), with the SDK's sqlite media cache
+/// bypassed — see the module docs for why Vesper owns the cache.
+async fn fetch_uncached(
+    client: &Client,
+    source: MediaSource,
+    thumb: Option<(u32, u32)>,
+    err_prefix: &str,
+    mxc: &str,
+) -> Result<Vec<u8>, ClientError> {
     if let Some((w, h)) = thumb {
         let request = MediaRequestParameters {
             source: source.clone(),
@@ -71,7 +107,7 @@ async fn fetch(
                 UInt::from(h),
             )),
         };
-        match client.media().get_media_content(&request, true).await {
+        match client.media().get_media_content(&request, false).await {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {
                 tracing::warn!(
@@ -87,9 +123,9 @@ async fn fetch(
     };
     client
         .media()
-        .get_media_content(&request, true)
+        .get_media_content(&request, false)
         .await
-        .map_err(|e| ClientError(format!("{err_prefix}: {e}")))
+        .map_err(|e| ClientError::network(format!("{err_prefix}: {e}")))
 }
 
 /// Resolve media to a `data:` URI for `img { src }`. MIME is sniffed from
@@ -119,10 +155,10 @@ pub async fn save_to(
     let mxc = attachment
         .mxc
         .as_deref()
-        .ok_or_else(|| ClientError("That attachment has no media source.".into()))?;
+        .ok_or_else(|| ClientError::invalid("That attachment has no media source."))?;
     let bytes = fetch(client, mxc, attachment.encrypted.as_deref(), None).await?;
     std::fs::write(dest, bytes)
-        .map_err(|e| ClientError(format!("Could not write the downloaded file: {e}")))?;
+        .map_err(|e| ClientError::storage(format!("Could not write the downloaded file: {e}")))?;
     Ok(())
 }
 
@@ -277,7 +313,7 @@ pub async fn send_attachment(
         return;
     };
     if let Err(e) = upload_and_send(room, &path, picked.name, caption, reply_to).await {
-        tracing::warn!(path, "attachment send failed: {}", e.0);
+        tracing::warn!(path, "attachment send failed: {}", e);
     }
 }
 
@@ -295,13 +331,13 @@ pub fn preflight_attachment(
     let path = picked
         .local_path
         .as_deref()
-        .ok_or_else(|| ClientError("No file was picked.".into()))?;
+        .ok_or_else(|| ClientError::invalid("No file was picked."))?;
     // Open (not just metadata) so permission errors surface too.
     std::fs::File::open(path)
-        .map_err(|e| ClientError(format!("Could not open the picked file: {e}")))?;
+        .map_err(|e| ClientError::storage(format!("Could not open the picked file: {e}")))?;
     if let Some(reply_to) = reply_to {
         EventId::parse(reply_to)
-            .map_err(|_| ClientError("Could not reply with an attachment yet — try again once the previous message has sent.".into()))?;
+            .map_err(|_| ClientError::invalid("Could not reply with an attachment yet — try again once the previous message has sent."))?;
     }
     Ok(())
 }
@@ -315,7 +351,7 @@ async fn upload_and_send(
 ) -> Result<(), ClientError> {
     let bytes = tokio::fs::read(path)
         .await
-        .map_err(|e| ClientError(format!("Could not read the picked file: {e}")))?;
+        .map_err(|e| ClientError::storage(format!("Could not read the picked file: {e}")))?;
     let mime: mime::Mime = infer::get(&bytes)
         .and_then(|k| k.mime_type().parse().ok())
         .unwrap_or(mime::APPLICATION_OCTET_STREAM);
@@ -363,7 +399,7 @@ async fn upload_and_send(
     if let Some(reply_to) = reply_to {
         let event_id = EventId::parse(&reply_to)
             .map(|e| e.to_owned())
-            .map_err(|_| ClientError("Could not attach the reply to the media.".into()))?;
+            .map_err(|_| ClientError::invalid("Could not attach the reply to the media."))?;
         config = config.reply(Some(Reply {
             event_id,
             enforce_thread: EnforceThread::Unthreaded,
@@ -372,11 +408,8 @@ async fn upload_and_send(
     }
 
     room.send_attachment(filename, &mime, bytes, config)
-        // Keep the upload in the media cache so Vesper's own preview of the
-        // sent row resolves from disk, not the network.
-        .store_in_cache()
         .await
-        .map_err(|e| ClientError(format!("Could not send the attachment: {e}")))?;
+        .map_err(|e| ClientError::network(format!("Could not send the attachment: {e}")))?;
     Ok(())
 }
 

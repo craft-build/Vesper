@@ -2,21 +2,76 @@
 //! memoized app-wide in `ClientState::media`.
 //!
 //! MXC content is content-addressed, so cached entries never expire; the
-//! on-disk half of the cache (SqliteMediaStore) handles restarts, this
-//! signal map handles refetch flicker within a session. Resolutions are
-//! keyed per MXC *and* requested thumb size (`"{mxc}|{w}x{h}"`, bare
-//! `"{mxc}"` for full content).
+//! on-disk half of the cache (`client::media_cache`, checkpoint 11) handles
+//! restarts with a 500 MB LRU cap, this signal map handles refetch flicker
+//! within a session. Resolutions are keyed per MXC *and* requested thumb
+//! size (`"{mxc}|{w}x{h}"`, bare `"{mxc}"` for full content).
+//!
+//! The in-memory map is itself capped (checkpoint 11 §C): data URIs are
+//! whole media payloads in RAM, so a long session scrolling large rooms
+//! would otherwise grow without bound. A FIFO/LRU order tracker evicts the
+//! oldest resolved entries past a byte budget (in-flight sentinels are
+//! zero-byte and never evicted while pending).
 
+use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Mutex;
 
 use dioxus::prelude::*;
 
 use crate::data::{ClientState, VesperClient};
 
+/// Memory budget for resolved data URIs (checkpoint 11 §C). Generous —
+/// thousands of avatars/thumbnails — but bounded.
+const MEM_CAP_BYTES: usize = 192 * 1024 * 1024;
+
+/// FIFO bookkeeping for the media map's byte cap. The map signal is only
+/// written from the UI thread's async runtime, so a plain static Mutex is
+/// race-free in practice (and correct regardless).
+static MEM_LRU: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
 fn cache_key(mxc: &str, thumb: Option<(u32, u32)>) -> String {
     match thumb {
         Some((w, h)) => format!("{mxc}|{w}x{h}"),
         None => mxc.to_string(),
+    }
+}
+
+/// Record an insert and enforce the byte cap, evicting the oldest resolved
+/// entries (never empty sentinels — they're in-flight fetch markers, and
+/// never the entry that triggered the sweep).
+fn enforce_mem_cap(
+    media: &mut Signal<std::collections::BTreeMap<String, String>, SyncStorage>,
+    inserted: &str,
+) {
+    let mut map = media.write();
+    let total: usize = map.values().map(|v| v.len()).sum();
+    if total <= MEM_CAP_BYTES {
+        return;
+    }
+    let mut order = MEM_LRU.lock().unwrap_or_else(|e| e.into_inner());
+    // Push keys we haven't seen (first insert wins; re-inserts keep the
+    // original position — a re-resolved key is rare and old-position is
+    // still a valid eviction order).
+    if !order.iter().any(|k| k == inserted) {
+        order.push_back(inserted.to_string());
+    }
+    let mut budget = total;
+    while budget > MEM_CAP_BYTES {
+        let Some(candidate) = order.front().cloned() else {
+            break;
+        };
+        if candidate == *inserted {
+            break; // never evict the entry that triggered this sweep
+        }
+        if let Some(uri) = map.get(&candidate) {
+            if uri.is_empty() {
+                break; // sentinel ordering guard; skip forward instead? keep simple
+            }
+            budget -= uri.len();
+            map.remove(&candidate);
+        }
+        order.pop_front();
     }
 }
 
@@ -69,7 +124,8 @@ pub fn use_media_src(
             spawn(async move {
                 match client.media_uri(&mxc, encrypted, thumb).await {
                     Ok(uri) => {
-                        media.write().insert(key, uri);
+                        media.write().insert(key.clone(), uri);
+                        enforce_mem_cap(&mut media, &key);
                     }
                     Err(e) => {
                         tracing::warn!("media {mxc}: {e}");

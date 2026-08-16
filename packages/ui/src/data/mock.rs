@@ -761,7 +761,7 @@ impl VesperClient for MockClient {
     // so callers (nav footer, settings header) repaint.
     async fn set_display_name(&self, name: String) -> Result<Me, ClientError> {
         if name.trim().is_empty() {
-            return Err(ClientError("Display name cannot be empty.".into()));
+            return Err(ClientError::invalid("Display name cannot be empty."));
         }
         let mut state = self.state.borrow_mut();
         state.me.name = name;
@@ -782,7 +782,7 @@ impl VesperClient for MockClient {
     async fn rename_device(&self, device_id: String, name: String) -> Result<(), ClientError> {
         let mut state = self.state.borrow_mut();
         let Some(device) = state.devices.iter_mut().find(|d| d.id == device_id) else {
-            return Err(ClientError("No such session.".into()));
+            return Err(ClientError::invalid("No such session."));
         };
         device.name = name;
         Ok(())
@@ -791,14 +791,14 @@ impl VesperClient for MockClient {
     async fn delete_device(&self, device_id: String, _password: String) -> Result<(), ClientError> {
         let mut state = self.state.borrow_mut();
         if state.devices.iter().any(|d| d.id == device_id && d.current) {
-            return Err(ClientError(
-                "Sign out instead of deleting this session.".into(),
+            return Err(ClientError::invalid(
+                "Sign out instead of deleting this session.",
             ));
         }
         let before = state.devices.len();
         state.devices.retain(|d| d.id != device_id);
         if state.devices.len() == before {
-            return Err(ClientError("No such session.".into()));
+            return Err(ClientError::invalid("No such session."));
         }
         Ok(())
     }
@@ -814,7 +814,7 @@ impl VesperClient for MockClient {
     ) -> Result<Vec<NotifToggle>, ClientError> {
         let mut state = self.state.borrow_mut();
         let Some(toggle) = state.notif.iter_mut().find(|t| t.id == toggle_id) else {
-            return Err(ClientError("Unknown notification setting.".into()));
+            return Err(ClientError::invalid("Unknown notification setting."));
         };
         toggle.enabled = enabled;
         Ok(state.notif.clone())
@@ -937,8 +937,8 @@ impl VesperClient for MockClient {
     // "forbidden" fixture exercises the modal's inline error state.
     async fn join_room(&self, room_id_or_alias: &str) -> Result<(), ClientError> {
         if room_id_or_alias.contains("forbidden") {
-            return Err(ClientError(
-                "You can't join that room (invite-only?).".into(),
+            return Err(ClientError::auth(
+                "You can't join that room (invite-only?).",
             ));
         }
         let mut state = self.state.borrow_mut();
@@ -996,7 +996,7 @@ impl VesperClient for MockClient {
         let had_room = state.convos.iter().any(|c| c.id == room_id);
         let had_space = state.spaces.iter().any(|s| s.id == room_id);
         if !had_room && !had_space {
-            return Err(ClientError("That room isn't in your list anymore.".into()));
+            return Err(ClientError::invalid("That room isn't in your list anymore."));
         }
         state.convos.retain(|c| c.id != room_id);
         state.spaces.retain(|s| s.id != room_id);

@@ -95,3 +95,16 @@ new messages in background rooms.
 > room isn't open (skip own events; truncate body previews; cfg-gate
 > non-wasm). Add narrow trait methods with default no-op impls so MockClient
 > still compiles. Verify everything two-way against an Element session.
+
+## Implemented / Deviations (retrospective footer)
+
+**Implemented**: typing indicators, read receipts (room-read on latest
+remote event while mounted), presence-driven DM status dots, desktop
+notifications suppressed while the window is focused.
+
+**Deviations**:
+- Presence updates now refresh DM rows through a per-user dirty set in
+  the room-list task (checkpoint 11 §C) instead of piggybacking on
+  full-list remaps.
+- Receipts are sent on timeline advance rather than on an explicit
+  "seen" computation; unreads come from sliding sync room data.

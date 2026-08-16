@@ -118,9 +118,76 @@ pub fn SettingsScreen(
         }
     });
 
-    // Server push-rule toggles (Notifications tab).
+    // Media cache size + clear + copy diagnostics (checkpoint 11 §C/§D).
+    let mut cache_bytes = use_signal(|| Option::<u64>::None);
+    let mut cache_clearing = use_signal(|| false);
+    let cache_resource = {
+        let client = client.clone();
+        use_resource(move || {
+            let client = client.clone();
+            async move { client.media_cache_bytes().await }
+        })
+    };
+    use_effect(move || {
+        if let Some(bytes) = cache_resource() {
+            cache_bytes.set(Some(bytes));
+        }
+    });
+
+    // Copy diagnostics: collects the redacted payload (client crate) and
+    // puts it on the clipboard via the webview's async clipboard API —
+    // dioxus-desktop 0.7 has no native clipboard writer, and the button
+    // click is the user gesture WKWebView requires to allow it.
+    let copy_diagnostics = move |_| {
+        spawn(async move {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let payload = client::diagnostics::collect();
+                let js = format!(
+                    "navigator.clipboard.writeText({}).then(() => dioxus.send(true), () => dioxus.send(false))",
+                    js_string_literal(&payload)
+                );
+                match document::eval(&js).recv::<bool>().await {
+                    Ok(true) => use_context::<crate::design_system::ToastCenter>()
+                        .success("Diagnostics copied", Some("Paste it into your issue report.".into())),
+                    _ => use_context::<crate::design_system::ToastCenter>()
+                        .info("Could not copy", Some("Your clipboard denied access.".into())),
+                }
+            }
+        });
+    };
+
+    // Clear the on-disk media cache; shows the freed amount, refreshes the
+    // size row. In-memory data URIs stay (they're the live rows' pixels).
+    let clear_cache = {
+        let client = client.clone();
+        move |_| {
+            let client = client.clone();
+            if cache_clearing() {
+                return;
+            }
+            cache_clearing.set(true);
+            spawn(async move {
+                match client.clear_media_cache().await {
+                    Ok(freed) => {
+                        use_context::<crate::design_system::ToastCenter>().success(
+                            "Media cache cleared",
+                            Some(format!("Freed {}.", client_bytes_label(freed))),
+                        );
+                    }
+                    Err(e) => {
+                        use_context::<crate::design_system::ToastCenter>().error(&e);
+                    }
+                }
+                cache_bytes.set(Some(client.media_cache_bytes().await));
+                cache_clearing.set(false);
+            });
+        }
+    };
+
+    // Server push-rule toggles (Notifications tab). Failures are toasts
+    // (checkpoint 11); the toggle rows re-render from refetched truth.
     let mut notif = use_signal(Vec::<NotifToggle>::new);
-    let mut notif_error = use_signal(|| Option::<String>::None);
     let notif_resource = {
         let client = client.clone();
         use_resource(move || {
@@ -191,7 +258,7 @@ pub fn SettingsScreen(
                     Ok(fresh) => {
                         use_context::<Signal<Option<Me>>>().set(Some(fresh));
                     }
-                    Err(e) => name_error.set(Some(e.0)),
+                    Err(e) => name_error.set(Some(e.message)),
                 }
                 name_saving.set(false);
             });
@@ -200,6 +267,8 @@ pub fn SettingsScreen(
 
     // Avatar upload: the file dialog runs inside a spawned task (never in
     // the event callback — macOS nested-pump crash, see docs/07 notes).
+    // Failures surface as toasts (checkpoint 11): there is no inline field
+    // next to the avatar button to hold them.
     let change_avatar = {
         let client = client.clone();
         move |_| {
@@ -218,7 +287,7 @@ pub fn SettingsScreen(
                         Ok(fresh) => {
                             use_context::<Signal<Option<Me>>>().set(Some(fresh));
                         }
-                        Err(e) => name_error.set(Some(e.0)),
+                        Err(e) => use_context::<crate::design_system::ToastCenter>().error(&e),
                     }
                 }
             });
@@ -324,7 +393,36 @@ pub fn SettingsScreen(
                                     SelectOption { value: "light".into(), label: "Light".into() },
                                 ],
                             }
-                            div {
+                            // Storage + support (checkpoint 11): media cache
+                            // usage/clear and the copy-diagnostics button.
+                            div { style: "font-size:13px;font-weight:700;letter-spacing:0.04em;color:var(--text-tertiary);", "STORAGE" }
+                            div { style: "display:flex;align-items:center;justify-content:space-between;gap:10px;",
+                                div {
+                                    div { style: "font-size:14px;", "Cached media" }
+                                    div { style: "font-size:12px;color:var(--text-tertiary);", "{cache_size_label(cache_bytes())}" }
+                                }
+                                Button {
+                                    variant: ButtonVariant::Secondary,
+                                    size: ButtonSize::Sm,
+                                    disabled: cache_clearing(),
+                                    onclick: clear_cache,
+                                    if cache_clearing() { "Clearing…" } else { "Clear" }
+                                }
+                            }
+                            div { style: "font-size:13px;font-weight:700;letter-spacing:0.04em;color:var(--text-tertiary);margin-top:8px;", "SUPPORT" }
+                            div { style: "display:flex;align-items:center;justify-content:space-between;gap:10px;",
+                                div {
+                                    div { style: "font-size:14px;", "Diagnostics" }
+                                    div { style: "font-size:12px;color:var(--text-tertiary);", "App info + a redacted tail of the log file" }
+                                }
+                                Button {
+                                    variant: ButtonVariant::Secondary,
+                                    size: ButtonSize::Sm,
+                                    onclick: copy_diagnostics,
+                                    "Copy"
+                                }
+                            }
+                                                        div {
                                 Button {
                                     variant: ButtonVariant::Danger,
                                     size: ButtonSize::Sm,
@@ -333,6 +431,7 @@ pub fn SettingsScreen(
                                         spawn(async move {
                                             if let Err(e) = client.logout().await {
                                                 tracing::warn!("logout failed: {e}");
+                                                use_context::<crate::design_system::ToastCenter>().error(&e);
                                             }
                                             use_context::<Signal<Option<Me>>>().set(None);
                                         });
@@ -355,7 +454,6 @@ pub fn SettingsScreen(
                                                 checked: enabled,
                                                 on_change: move |_| {
                                                     let client = client.clone();
-                                                    notif_error.set(None);
                                                     // Optimistic flip; the result
                                                     // list replaces state wholesale.
                                                     let mut optimistic = notif();
@@ -369,7 +467,10 @@ pub fn SettingsScreen(
                                                         match client.set_notification_rule(tid, next).await {
                                                             Ok(list) => notif.set(list),
                                                             Err(e) => {
-                                                                notif_error.set(Some(e.0));
+                                                                // Toast (checkpoint 11):
+                                                                // the toggle itself
+                                                                // re-renders from truth.
+                                                                use_context::<crate::design_system::ToastCenter>().error(&e);
                                                                 // Refetch to restore truth.
                                                                 if let Ok(list) = client.notification_rules().await {
                                                                     notif.set(list);
@@ -382,9 +483,6 @@ pub fn SettingsScreen(
                                         }
                                     }
                                 }
-                            }
-                            if let Some(err) = notif_error() {
-                                div { style: "font-size:12px;color:var(--status-away);", "{err}" }
                             }
                             div { style: "font-size:13px;font-weight:700;letter-spacing:0.04em;color:var(--text-tertiary);margin-top:8px;", "PRIVACY" }
                             Switch {
@@ -562,7 +660,7 @@ pub fn SettingsScreen(
                                                     let list = client.devices().await;
                                                     devices.set(list);
                                                 }
-                                                Err(e) => dialog_error.set(Some(e.0)),
+                                                Err(e) => dialog_error.set(Some(e.message)),
                                             }
                                             dialog_busy.set(false);
                                         });
@@ -586,4 +684,43 @@ pub fn SettingsScreen(
             })}
         }
     }
+}
+
+/// Human label for the media cache size row.
+fn cache_size_label(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(bytes) => format!("{} on disk (auto-limited to 500 MB)", client_bytes_label(bytes)),
+        None => "Unknown".into(),
+    }
+}
+
+/// Compact byte formatter shared by the cache rows/toasts.
+fn client_bytes_label(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1_024 {
+        format!("{} KB", bytes.div_ceil(1_024))
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Escape a Rust string into a JS string literal (no serde_json dep in
+/// this crate; the payload is plain text with newlines and quotes).
+fn js_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

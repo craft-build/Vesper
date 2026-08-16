@@ -75,7 +75,7 @@ pub async fn start_room_list(
         .with_offline_mode()
         .build()
         .await
-        .map_err(|e| ClientError(format!("Could not build the sync service: {e}")))?;
+        .map_err(|e| ClientError::server(format!("Could not build the sync service: {e}")))?;
 
     // Our own MXID, captured once for DM-counterpart resolution (checkpoint
     // 06): a DM's `Convo.mxid` is the *other* member, and `Convo.status` is
@@ -87,10 +87,10 @@ pub async fn start_room_list(
     // unread counts under sliding sync); do not call it again here.
     let room_list_service = RoomListService::new(client)
         .await
-        .map_err(|e| ClientError(format!("Could not build the room list service: {e}")))?;
+        .map_err(|e| ClientError::server(format!("Could not build the room list service: {e}")))?;
 
     let all_rooms = room_list_service.all_rooms().await.map_err(|e| {
-        ClientError(format!(
+        ClientError::unsupported(format!(
             "The server does not support simplified sliding sync: {e}"
         ))
     })?;
@@ -117,7 +117,23 @@ pub async fn start_room_list(
         controller.set_filter(Box::new(new_filter_all(vec![])));
         let mut entries = Box::pin(entries);
         let mut loading = Box::pin(all_rooms.loading_state());
-        let mut items: Vec<RoomListItem> = Vec::new();
+        // Checkpoint 11 §C: `rows` keeps each `RoomListItem` paired with its
+        // mapped `Convo`, so a diff batch only (re)maps the values it
+        // carries — O(batch) remaps, never a full-list rebuild on the
+        // high-churn path (busy accounts used to re-run every per-room
+        // async store lookup per batch). Placeholder convos ride along for
+        // spaces and invites; publish filters them out.
+        let mut rows: Vec<(RoomListItem, Convo)> = Vec::new();
+        // Mapped spaces keyed by room id; a batch carrying a space room
+        // refreshes its entry (spaces diff like any other room when their
+        // children change), a room that stops being a space drops out.
+        let mut space_cache: HashMap<String, Space> = HashMap::new();
+        let mut spaces: Vec<Space>;
+        let mut membership: HashMap<String, String> = HashMap::new();
+        // Last presence snapshot the convos were mapped against: DM status
+        // dots refresh by remapping only the rooms whose counterpart
+        // changed (previously this fell out of the per-batch full remap).
+        let mut presence_seen: BTreeMap<String, Presence> = BTreeMap::new();
         // Only log the invite count when it changes — it re-derives per batch.
         let mut logged_invites = 0usize;
         loop {
@@ -126,15 +142,25 @@ pub async fn start_room_list(
                     Some(batch) => {
                         tracing::info!(
                             diffs = batch.len(),
-                            total = items.len(),
+                            total = rows.len(),
                             "applying room list diff batch"
                         );
-                        apply_diffs(&mut items, batch);
+                        // Map only the carried values (see `attach`), then
+                        // reuse the tested diff applier over paired rows.
+                        let paired = attach(
+                            batch,
+                            own_id.as_ref(),
+                            presence_signal,
+                            &membership,
+                            &mut space_cache,
+                        )
+                        .await;
+                        apply_diffs(&mut rows, paired);
                         // Invites show up in `all_rooms` too; the UI has
                         // nowhere to render them — skip + log count (docs/03).
-                        const JOINED: fn(&&RoomListItem) -> bool =
-                            |i| i.state() == RoomState::Joined;
-                        let invite_count = items.len() - items.iter().filter(JOINED).count();
+                        const JOINED: fn(&&(RoomListItem, Convo)) -> bool =
+                            |r| r.0.state() == RoomState::Joined;
+                        let invite_count = rows.len() - rows.iter().filter(JOINED).count();
                         if invite_count != logged_invites {
                             tracing::info!(
                                 count = invite_count,
@@ -142,27 +168,35 @@ pub async fn start_room_list(
                             );
                             logged_invites = invite_count;
                         }
-                        // Spaces (checkpoint 09): joined rooms whose create
-                        // event says `m.space`. They leave the flat convo
-                        // list (the drawer renders them as section headers)
-                        // and their `m.space.child` state decides which
-                        // rooms group underneath.
-                        let spaces: Vec<Space> = futures::future::join_all(
-                            items
-                                .iter()
-                                .filter(|i| i.state() == RoomState::Joined && i.is_space())
-                                .map(map_space),
-                        )
-                        .await;
-                        let membership = space_membership(&spaces);
-                        let mapped: Vec<Convo> = futures::future::join_all(
-                            items
-                                .iter()
-                                .filter(|i| i.state() == RoomState::Joined && !i.is_space())
-                                .map(|i| map_item(i, own_id.as_ref(), presence_signal, &membership)),
-                        )
-                        .await;
-                        publish(&mut convos_signal, &snapshot, mapped);
+                        // Spaces (checkpoint 09): rebuilt from the cache —
+                        // only spaces carried by this batch were re-mapped.
+                        spaces = rows
+                            .iter()
+                            .filter(|(i, _)| i.state() == RoomState::Joined && i.is_space())
+                            .filter_map(|(i, _)| space_cache.get(i.room_id().as_str()).cloned())
+                            .collect();
+                        let new_membership = space_membership(&spaces);
+                        if new_membership != membership {
+                            // A space's children changed: refresh only the
+                            // rooms whose grouping actually moved.
+                            for row in rows.iter_mut() {
+                                if row.0.state() != RoomState::Joined || row.0.is_space() {
+                                    continue;
+                                }
+                                let want = new_membership.get(row.0.room_id().as_str()).cloned();
+                                if row.1.space != want {
+                                    row.1 = map_item(
+                                        &row.0,
+                                        own_id.as_ref(),
+                                        presence_signal,
+                                        &new_membership,
+                                    )
+                                    .await;
+                                }
+                            }
+                            membership = new_membership;
+                        }
+                        publish_rows(&mut convos_signal, &snapshot, &rows);
                         publish_spaces(&mut spaces_signal, &spaces_snapshot, spaces);
                     }
                     None => break,
@@ -191,19 +225,57 @@ pub async fn start_room_list(
                     None => break,
                 },
             }
+            // Presence-driven DM refresh (every loop wake): remap only DM
+            // rows whose counterpart's presence changed since the last
+            // pass, then republish if anything moved.
+            let current = presence_signal.peek().clone();
+            let changed: Vec<&String> = current
+                .iter()
+                .filter(|(id, p)| presence_seen.get(*id).as_ref() != Some(p))
+                .map(|(id, _)| id)
+                .collect();
+            if !changed.is_empty() {
+                let mut changed_any = false;
+                for row in rows.iter_mut() {
+                    if row.0.state() != RoomState::Joined
+                        || row.0.is_space()
+                        || row.1.kind != ConvoKind::Dm
+                    {
+                        continue;
+                    }
+                    if let Some(mxid) = row.1.mxid.as_ref() {
+                        if changed.contains(&mxid) {
+                            row.1 =
+                                map_item(&row.0, own_id.as_ref(), presence_signal, &membership)
+                                    .await;
+                            changed_any = true;
+                        }
+                    }
+                }
+                presence_seen = current;
+                if changed_any {
+                    publish_rows(&mut convos_signal, &snapshot, &rows);
+                }
+            }
         }
     });
 
     Ok(SyncHandles { service, task })
 }
 
-/// Write the mapped list to both the signal (reactive reads in the UI) and
-/// the synchronous snapshot (`conversations()`).
-fn publish(
+/// Write the mapped list (joined, non-space rows) to both the signal
+/// (reactive reads in the UI) and the synchronous snapshot
+/// (`conversations()`).
+fn publish_rows(
     signal: &mut Signal<Vec<Convo>, SyncStorage>,
     snapshot: &Arc<RwLock<Vec<Convo>>>,
-    convos: Vec<Convo>,
+    rows: &[(RoomListItem, Convo)],
 ) {
+    let convos: Vec<Convo> = rows
+        .iter()
+        .filter(|(item, _)| item.state() == RoomState::Joined && !item.is_space())
+        .map(|(_, convo)| convo.clone())
+        .collect();
     *snapshot.write().unwrap_or_else(|e| e.into_inner()) = convos.clone();
     signal.set(convos);
 }
@@ -216,6 +288,118 @@ fn publish_spaces(
 ) {
     *snapshot.write().unwrap_or_else(|e| e.into_inner()) = spaces.clone();
     signal.set(spaces);
+}
+
+/// Placeholder convo for rows that never publish (spaces, invites).
+fn placeholder_convo(id: &str) -> Convo {
+    Convo {
+        id: id.to_string(),
+        kind: ConvoKind::Room,
+        name: String::new(),
+        last: String::new(),
+        unread: 0,
+        encrypted: false,
+        avatar: None,
+        mxid: None,
+        status: None,
+        topic: None,
+        space: None,
+        members: None,
+    }
+}
+
+/// Pair one carried item with its mapped convo, maintaining the space
+/// cache on the way (spaces in, demoted rooms out).
+async fn pair(
+    item: RoomListItem,
+    own_id: Option<&matrix_sdk::ruma::OwnedUserId>,
+    presence_signal: dioxus_signals::Signal<BTreeMap<String, Presence>, dioxus_signals::SyncStorage>,
+    membership: &HashMap<String, String>,
+    space_cache: &mut HashMap<String, Space>,
+) -> (RoomListItem, Convo) {
+    let id = item.room_id().to_string();
+    if item.is_space() {
+        let space = map_space(&item).await;
+        space_cache.insert(id, space);
+        return (item, placeholder_convo(""));
+    }
+    space_cache.remove(&id);
+    if item.state() == RoomState::Joined {
+        let convo = map_item(&item, own_id, presence_signal, membership).await;
+        (item, convo)
+    } else {
+        (item, placeholder_convo(&id))
+    }
+}
+
+/// Map the values a diff batch carries onto paired rows — the O(batch)
+/// heart of the checkpoint-11 remap. Diff shapes pass through untouched;
+/// only carried values pay the (async) mapping cost.
+async fn attach(
+    diffs: Vec<VectorDiff<RoomListItem>>,
+    own_id: Option<&matrix_sdk::ruma::OwnedUserId>,
+    presence_signal: dioxus_signals::Signal<BTreeMap<String, Presence>, dioxus_signals::SyncStorage>,
+    membership: &HashMap<String, String>,
+    space_cache: &mut HashMap<String, Space>,
+) -> Vec<VectorDiff<(RoomListItem, Convo)>> {
+    #[allow(clippy::items_after_statements)]
+    async fn pair_ref(
+        item: &RoomListItem,
+        own_id: Option<&matrix_sdk::ruma::OwnedUserId>,
+        presence_signal: dioxus_signals::Signal<
+            BTreeMap<String, Presence>,
+            dioxus_signals::SyncStorage,
+        >,
+        membership: &HashMap<String, String>,
+        space_cache: &mut HashMap<String, Space>,
+    ) -> (RoomListItem, Convo) {
+        pair(item.clone(), own_id, presence_signal, membership, space_cache).await
+    }
+
+    let mut out = Vec::with_capacity(diffs.len());
+    for diff in diffs {
+        let paired = match diff {
+            VectorDiff::Append { values } => {
+                let mut mapped = Vec::with_capacity(values.len());
+                for v in values.iter() {
+                    mapped.push(pair_ref(v, own_id, presence_signal, membership, space_cache).await);
+                }
+                VectorDiff::Append {
+                    values: mapped.into_iter().collect(),
+                }
+            }
+            VectorDiff::Clear => VectorDiff::Clear,
+            VectorDiff::PushFront { value } => VectorDiff::PushFront {
+                value: pair_ref(&value, own_id, presence_signal, membership, space_cache).await,
+            },
+            VectorDiff::PushBack { value } => VectorDiff::PushBack {
+                value: pair_ref(&value, own_id, presence_signal, membership, space_cache).await,
+            },
+            VectorDiff::PopFront => VectorDiff::PopFront,
+            VectorDiff::PopBack => VectorDiff::PopBack,
+            VectorDiff::Insert { index, value } => VectorDiff::Insert {
+                index,
+                value: pair_ref(&value, own_id, presence_signal, membership, space_cache).await,
+            },
+            VectorDiff::Set { index, value } => VectorDiff::Set {
+                index,
+                value: pair_ref(&value, own_id, presence_signal, membership, space_cache).await,
+            },
+            VectorDiff::Remove { index } => VectorDiff::Remove { index },
+            VectorDiff::Truncate { length } => VectorDiff::Truncate { length },
+            VectorDiff::Reset { values } => {
+                let mut mapped = Vec::with_capacity(values.len());
+                for v in values.iter() {
+                    mapped.push(pair_ref(v, own_id, presence_signal, membership, space_cache).await);
+                }
+                VectorDiff::Reset {
+                    values: mapped.into_iter().collect(),
+                }
+            }
+        };
+        out.push(paired);
+    }
+    out
 }
 
 /// Map one space room to the UI's [`Space`] summary. Children come from the
@@ -466,6 +650,46 @@ mod tests {
 
         apply_diffs(&mut v, vec![VectorDiff::Clear]);
         assert!(v.is_empty());
+    }
+
+    // Checkpoint 11 §C: the paired-rows applier must keep items and their
+    // mapped convos index-aligned through every diff shape — the O(batch)
+    // remap depends on it.
+    #[test]
+    fn apply_diffs_keeps_pairs_aligned() {
+        let mk = |n: i32| (n, n * 10);
+        let mut rows: Vec<(i32, i32)> = Vec::new();
+        apply_diffs(
+            &mut rows,
+            vec![VectorDiff::Append {
+                values: vec![mk(1), mk(2), mk(3)].into_iter().collect(),
+            }],
+        );
+        assert_eq!(rows, vec![mk(1), mk(2), mk(3)]);
+
+        apply_diffs(
+            &mut rows,
+            vec![
+                VectorDiff::Set {
+                    index: 1,
+                    value: mk(9),
+                },
+                VectorDiff::PushFront {
+                    value: mk(0),
+                },
+                VectorDiff::Remove { index: 2 },
+            ],
+        );
+        // After Set: [1,9,3]; PushFront: [0,1,9,3]; Remove(2): [0,1,3].
+        assert_eq!(rows, vec![mk(0), mk(1), mk(3)]);
+        for (item, convo) in &rows {
+            assert_eq!(*convo, item * 10, "pairs stay aligned");
+        }
+
+        apply_diffs(&mut rows, vec![VectorDiff::Truncate { length: 1 }]);
+        assert_eq!(rows, vec![mk(0)]);
+        apply_diffs(&mut rows, vec![VectorDiff::Clear]);
+        assert!(rows.is_empty());
     }
 
     #[test]

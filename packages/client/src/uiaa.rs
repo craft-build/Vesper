@@ -32,12 +32,12 @@ pub async fn delete_device_with_password(
         Ok(_) => Ok(()),
         Err(e) => {
             let Some(info) = e.as_uiaa_response() else {
-                return Err(ClientError(GENERIC.into()));
+                return Err(ClientError::auth(GENERIC));
             };
             // SSO-only accounts never offer a password stage: fail with a
             // message the dialog can show instead of a dead retry loop.
             if !password_stage_available(info) {
-                return Err(ClientError(NO_PASSWORD_FLOW.into()));
+                return Err(ClientError::unsupported(NO_PASSWORD_FLOW));
             }
             // Echo the session when the challenge provides one; servers vary.
             let mut stage = uiaa::Password::new(
@@ -45,7 +45,7 @@ pub async fn delete_device_with_password(
                     client
                         .user_id()
                         .map(|u| u.to_string())
-                        .ok_or_else(|| ClientError("Not signed in.".into()))?,
+                        .ok_or_else(|| ClientError::auth("Not signed in."))?,
                 )),
                 password,
             );
@@ -60,9 +60,9 @@ pub async fn delete_device_with_password(
                 // 401 on the *second* try = wrong password (or a flow we
                 // can't complete); anything else is a server/network issue.
                 Err(retry) if retry.as_uiaa_response().is_some() => {
-                    Err(ClientError(BAD_PASSWORD.into()))
+                    Err(ClientError::auth(BAD_PASSWORD))
                 }
-                Err(_) => Err(ClientError(GENERIC.into())),
+                Err(_) => Err(ClientError::auth(GENERIC)),
             }
         }
     }

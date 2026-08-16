@@ -1,0 +1,33 @@
+# Dioxus CLI config for the Vesper desktop app (checkpoint 11 §E).
+# Build/bundle from this directory:
+#   dx bundle --platform desktop --release
+# → target/dx/vesper/bundle/macos/macos/Vesper.app — ad-hoc signed, icon
+# embedded, verified to launch standalone. The bundler's DMG step fails in
+# this environment ("hdiutil create: Directory not empty" even for trivial
+# folders — an environment-level hdiutil issue, not a bundle defect);
+# create the DMG manually once resolved:
+#   hdiutil create -volname Vesper -srcfolder <staging>/Vesper \
+#     -ov -format UDZO Vesper_0.1.0_aarch64.dmg
+# Windows/Linux bundles are documented follow-ups (docs/11 §E); auto-update
+# is explicitly out of scope for this release.
+
+[application]
+name = "vesper"
+default_platform = "desktop"
+out_dir = "dist"
+asset_dir = "assets"
+subsource_style = "verbose"
+
+[web.app]
+title = "Vesper"
+
+[bundle]
+identifier = "dev.vesper.app"
+# The .icns ships as the bundle icon (CFBundleIconFile); regenerate
+# it from assets/icon.png with scripts/make-icns.sh.
+icon = ["assets/icon.icns"]
+publisher = "Vesper"
+category = "SocialNetworking"
+copyright = "Copyright (c) 2026 Vesper contributors"
+short_description = "Encrypted, federated chat on Matrix"
+long_description = "Vesper is a native Matrix client: encrypted rooms and DMs, threads, spaces, and media, in one quiet desktop app."

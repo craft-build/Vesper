@@ -24,6 +24,8 @@ matrix = [
     "dep:base64",
     "dep:mime",
     "dep:getrandom",
+    "dep:keyring",
+    "dep:filetime",
 ]
 
 [dependencies]
@@ -60,7 +62,25 @@ base64 = { version = "0.22", optional = true }
 # Same version family as matrix-sdk re-exports (attachment::Thumbnail is
 # typed over `mime::Mime`).
 mime = { version = "0.3", optional = true }
+# Media-cache LRU eviction needs portable mtime manipulation (checkpoint 11).
+filetime = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tempfile = "3"
+
+# Checkpoint 11: session blob + crypto-store passphrase live in the OS
+# keychain. keyring v4 ships backend stores as features, target-gated so
+# each platform only pulls its own backend (an unconditional feature list
+# would drag Windows-only crates into every graph). Linux deliberately has
+# no backend here: headless/keyring-less installs take the loud file
+# fallback in `secrets.rs` (a zbus secret-service backend is the documented
+# follow-up).
+[target.'cfg(target_os = "macos")'.dependencies]
+# v1 = the app-facing Entry API; it transitively enables the apple backend
+# store with its required `keychain` sub-feature (that store dep is itself
+# target-gated inside keyring, so no Windows/Linux crates leak in here).
+keyring = { version = "4", default-features = false, features = ["v1"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "4", default-features = false, features = ["v1", "windows-native-keyring-store"], optional = true }

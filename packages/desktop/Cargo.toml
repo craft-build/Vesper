@@ -1,9 +1,16 @@
 [package]
-name = "desktop"
+# The binary name is the product name: `dx bundle` titles the .app/.dmg
+# from it (a package named `desktop` would ship "Desktop.app").
+name = "vesper"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 dioxus = { workspace = true, features = ["router", "desktop"] }
 ui = { workspace = true, features = ["desktop"] }
+# Checkpoint 11 §D: diagnostics live in the client crate (log dir, panic
+# screen state, redaction); the launcher owns the subscriber + hook.
+client = { workspace = true, features = ["matrix"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
+tracing = "0.1"

@@ -104,3 +104,20 @@ open. Encrypted events render as placeholders until checkpoint 08.
 > it. Live messages must append without reopening the room. Test with a real
 > busy room plus an encrypted placeholder room. Update the trait + MockClient
 > to keep mock mode compiling.
+
+## Implemented / Deviations (retrospective footer)
+
+**Implemented**: live per-room timelines via SDK `Timeline` diff
+subscriptions → `messages` map signal, refcounted open/close tied to the
+Conversation component, back-pagination on scroll-to-top with scroll
+anchoring (at-bottom pin, prepend offset restore), local echoes through
+the diff stream (never hand-merged).
+
+**Deviations**:
+- Initial load backfills to one ~30-event page (not "full history"):
+  matrix-sdk-ui paginates; full history on open was never sensible. A
+  rendered-rows cap (newest 800) was added in checkpoint 11 §C as the
+  virtualization sanity check — true viewport virtualization remains
+  future work.
+- Retry/discard of pending sends arrived with the send-queue integration
+  (checkpoint 05 follow-up) rather than in this checkpoint.

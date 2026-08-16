@@ -101,3 +101,21 @@ every deliverable demo-able on a real account from checkpoint 02 onward.
   `matrix_sdk=warn` unless debugging.
 - Data directory: `dirs::data_dir()/vesper` (per-platform), one subdirectory
   per session/device ID.
+
+## Implemented / Deviations (retrospective footer)
+
+All eleven checkpoints shipped (01–11). The architecture held: the
+`VesperClient` seam, runtime-thread SDK ownership, sync-storage signals
+from the App scope, mock-first UI development. Notable global
+deviations, each detailed in the per-checkpoint footers:
+
+- **Secrets in the OS keyring** instead of mode-restricted files
+  (checkpoint 11 §B; affects 02's session persistence and 08's store
+  passphrase).
+- **Vesper-owned media cache** with a 500 MB LRU cap instead of the SDK's
+  unevicted sqlite media store (11 §C; affects 07).
+- **O(batch) room-list diff application** pairing items with mapped rows
+  (11 §C; affects 03) and a rendered-rows cap in timelines (affects 04).
+- **Web target deferred** with rationale (11 §F): the trait seam and wasm
+  build stay green, but shipping a real-backend web port was out of the
+  spike window.

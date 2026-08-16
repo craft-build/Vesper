@@ -164,3 +164,23 @@ with progress and correct `m.image`/`m.file` events.
 - **Mapped but not interactive**: `m.video`/`m.audio` render as file cards
   (kinds `Video`/`Audio` exist for icons/labels; no players). Stickers,
   galleries (msc4274), and thread-panel reply avatars stay unmapped.
+
+## Implemented / Deviations (retrospective footer)
+
+**Implemented**: MXC → `data:` URI resolution (webview-safe), encrypted
+media (transparent decryption via serialized `EncryptedFile`), server
+thumbnails at display size, image downscale for composer thumbnails,
+file cards for non-image types, save-to-disk with native save dialog,
+avatars for users/rooms/spaces.
+
+**Deviations**:
+- **Vesper owns the on-disk cache now (checkpoint 11 §C).** The plan used
+  the SDK's sqlite media store; nothing in matrix-sdk 0.18 evicts it, so
+  media instead flows through `client::media_cache` — a 500 MB LRU-cap
+  store with a settings size/clear row. The SDK store is bypassed
+  (`use_cache = false`).
+- The in-memory data-URI map gained a 192 MB FIFO cap (checkpoint 11 §C);
+  entries re-resolve from disk on eviction.
+- Web target: media paths under wasm remain the `data:` URI scheme
+  already, so the plan's "blob URL" concern only applies to the deferred
+  real-backend web port (docs/11 §F).

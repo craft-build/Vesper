@@ -91,3 +91,13 @@ instantly in the open timeline and confirmed by the server.
 > EventSendState → Message.send_state and style the composer/rows for
 > Sending/Failed with retry/discard. Verify offline queue-and-flush by
 > disabling networking mid-send. Keep MockClient compiling and behaving.
+
+## Implemented / Deviations (retrospective footer)
+
+**Implemented**: replies, reactions, live thread panels, thread
+summaries; pending-send states (sending/failed) with retry + discard
+wired to the SDK send queue handles.
+
+**Deviations**: none of substance. Thread roots that fail to resolve are
+keyed by event id in the live `threads` map (edge case the plan didn't
+address).

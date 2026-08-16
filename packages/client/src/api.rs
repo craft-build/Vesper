@@ -89,12 +89,90 @@ pub struct ClientState {
     pub verification: Signal<Option<VerificationSession>, SyncStorage>,
 }
 
+/// Structured classification of a [`ClientError`] (checkpoint 11,
+/// workstream A): surfaces pick presentation from the kind — tone of the
+/// toast, whether a "sign in again" nudge or a retry affordance makes sense
+/// — while `message` stays the fixed, user-facing sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientErrorKind {
+    /// Transport-level failure (offline, DNS, unreachable server). The SDK
+    /// retries sync on its own; user-level retry is reasonable for sends.
+    Network,
+    /// Credentials rejected or the session expired — surface "sign in
+    /// again"; a retry will not help.
+    Auth,
+    /// Server rate limit (`M_LIMIT_EXCEEDED`). Wait, then retry.
+    RateLimited,
+    /// The request itself was invalid (bad input, unknown room…). Fix the
+    /// input; do not blind-retry.
+    Invalid,
+    /// The server understood and refused the request (5xx, Matrix errors
+    /// without a special case). A retry may work later.
+    Server,
+    /// Local I/O or storage failure (data dir, session store, keyring
+    /// fallback file).
+    Storage,
+    /// The operation isn't supported by this backend or build (mock
+    /// defaults, platform gaps).
+    Unsupported,
+    /// Anything unrecognized — the last resort, never silently.
+    Unknown,
+}
+
+/// A backend error: a [`ClientErrorKind`] plus the fixed user-facing
+/// sentence. Credentials never appear in `message` (see `session.rs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientError(pub String);
+pub struct ClientError {
+    pub kind: ClientErrorKind,
+    pub message: String,
+}
+
+impl ClientError {
+    #[must_use]
+    pub fn new(kind: ClientErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn network(message: impl Into<String>) -> Self {
+        Self::new(ClientErrorKind::Network, message)
+    }
+    #[must_use]
+    pub fn auth(message: impl Into<String>) -> Self {
+        Self::new(ClientErrorKind::Auth, message)
+    }
+    #[must_use]
+    pub fn rate_limited(message: impl Into<String>) -> Self {
+        Self::new(ClientErrorKind::RateLimited, message)
+    }
+    #[must_use]
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self::new(ClientErrorKind::Invalid, message)
+    }
+    #[must_use]
+    pub fn server(message: impl Into<String>) -> Self {
+        Self::new(ClientErrorKind::Server, message)
+    }
+    #[must_use]
+    pub fn storage(message: impl Into<String>) -> Self {
+        Self::new(ClientErrorKind::Storage, message)
+    }
+    #[must_use]
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::new(ClientErrorKind::Unsupported, message)
+    }
+    #[must_use]
+    pub fn unknown(message: impl Into<String>) -> Self {
+        Self::new(ClientErrorKind::Unknown, message)
+    }
+}
 
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.message)
     }
 }
 
@@ -235,7 +313,7 @@ pub trait VesperClient {
     /// shell. Empty names are rejected (they would *remove* the name).
     async fn set_display_name(&self, name: String) -> Result<Me, ClientError> {
         let _ = name;
-        Err(ClientError("Not supported by this backend.".into()))
+        Err(ClientError::unsupported("Not supported by this backend."))
     }
 
     /// Upload `path`'s bytes as the account avatar (the file is picked on
@@ -243,13 +321,13 @@ pub trait VesperClient {
     /// the fresh identity snapshot with the new `avatar` mxc.
     async fn set_avatar(&self, path: String) -> Result<Me, ClientError> {
         let _ = path;
-        Err(ClientError("Not supported by this backend.".into()))
+        Err(ClientError::unsupported("Not supported by this backend."))
     }
 
     /// Rename a session by device id (no re-auth needed).
     async fn rename_device(&self, device_id: String, name: String) -> Result<(), ClientError> {
         let _ = (device_id, name);
-        Err(ClientError("Not supported by this backend.".into()))
+        Err(ClientError::unsupported("Not supported by this backend."))
     }
 
     /// Delete another session, re-authenticating with `password` if the
@@ -258,13 +336,13 @@ pub trait VesperClient {
     /// use [`Self::logout`]. The password never appears in logs or errors.
     async fn delete_device(&self, device_id: String, password: String) -> Result<(), ClientError> {
         let _ = (device_id, password);
-        Err(ClientError("Not supported by this backend.".into()))
+        Err(ClientError::unsupported("Not supported by this backend."))
     }
 
     /// The push-rule toggles of the notification settings (see
     /// `client::notifications::RULE_TABLE` for the toggle↔rule mapping).
     async fn notification_rules(&self) -> Result<Vec<NotifToggle>, ClientError> {
-        Err(ClientError("Not supported by this backend.".into()))
+        Err(ClientError::unsupported("Not supported by this backend."))
     }
 
     /// Flip one toggle (writing every Matrix rule behind it) and return the
@@ -276,7 +354,7 @@ pub trait VesperClient {
         enabled: bool,
     ) -> Result<Vec<NotifToggle>, ClientError> {
         let _ = (toggle_id, enabled);
-        Err(ClientError("Not supported by this backend.".into()))
+        Err(ClientError::unsupported("Not supported by this backend."))
     }
 
     /// Device-local application preferences (theme, receipt/typing opt-outs)
@@ -288,7 +366,7 @@ pub trait VesperClient {
     /// Persist preferences (versioned `prefs.json`).
     async fn set_prefs(&self, prefs: Prefs) -> Result<(), ClientError> {
         let _ = prefs;
-        Err(ClientError("Not supported by this backend.".into()))
+        Err(ClientError::unsupported("Not supported by this backend."))
     }
 
     /// Start (or replace) an interactive verification session against
@@ -351,9 +429,7 @@ pub trait VesperClient {
         _encrypted: Option<String>,
         _thumb: Option<(u32, u32)>,
     ) -> Result<String, ClientError> {
-        Err(ClientError(
-            "Media is not supported by this backend.".into(),
-        ))
+        Err(ClientError::unsupported("Media is not supported by this backend."))
     }
 
     /// Save `attachment`'s full-resolution content to `dest_path`
@@ -366,8 +442,24 @@ pub trait VesperClient {
         _attachment: Attachment,
         _dest_path: String,
     ) -> Result<(), ClientError> {
-        Err(ClientError(
-            "Media is not supported by this backend.".into(),
-        ))
+        Err(ClientError::unsupported("Media is not supported by this backend."))
+    }
+
+    // ------------------------------------------------------------------
+    // Diagnostics & maintenance (checkpoint 11): the media cache cap and
+    // the copy-diagnostics payload. Defaults keep mock/wasm backends
+    // honest without implementing storage they don't have.
+    // ------------------------------------------------------------------
+
+    /// Bytes used by the on-disk media cache (settings row, checkpoint
+    /// 11 §C). Backends without a cache report 0.
+    async fn media_cache_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Delete every cached media entry; returns the bytes freed. Cached
+    /// media re-fetches on demand.
+    async fn clear_media_cache(&self) -> Result<u64, ClientError> {
+        Err(ClientError::unsupported("No media cache on this backend."))
     }
 }

@@ -95,3 +95,17 @@ preferences, and full logout (incl. token invalidation).
 > local store. Wire every tab in screens/settings_screen.rs keeping the
 > existing design system, give MockClient complete fake implementations, and
 > verify against Element plus a second test account.
+
+## Implemented / Deviations (retrospective footer)
+
+**Implemented**: display-name editing, avatar upload, theme + local
+prefs (typing/receipt opt-outs), device/session list with rename +
+password-verified deletion (UIAA), server push-rule toggles, logout.
+
+**Deviations**:
+- The **media cache size + Clear row** the plan promised from "checkpoint
+  10 settings" landed in checkpoint 11 §C with the cache itself.
+- Notification-toggle failures surface as toasts with truth-refetch
+  (checkpoint 11 §A) rather than an inline error line.
+- A "Copy diagnostics" row (STORAGE/SUPPORT sections) was added in
+  checkpoint 11 §D — redacted log tail + app facts, no message content.

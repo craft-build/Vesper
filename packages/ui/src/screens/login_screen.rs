@@ -33,7 +33,7 @@ pub fn LoginScreen(on_login: EventHandler<Me>) -> Element {
             match client.login(homeserver, user_id, pw).await {
                 Ok(me) => on_login.call(me),
                 Err(e) => {
-                    error.set(Some(e.0));
+                    error.set(Some(e.message));
                     // Drop the password so a typo can't linger, but keep what
                     // the user typed in the other fields.
                     password.set(String::new());

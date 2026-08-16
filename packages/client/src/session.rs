@@ -3,18 +3,17 @@
 //! Everything here runs inside the runtime thread's tokio runtime; the
 //! [`matrix_sdk::Client`] it produces must never leave that thread.
 //!
-//! Storage layout under the OS data dir (macOS: `~/Library/Application Support/vesper/`):
+//! Storage layout (checkpoint 11): secrets live in the OS keyring via the
+//! [`secrets`] module (service `dev.vesper.app`); everything else under the
+//! OS data dir (macOS: `~/Library/Application Support/vesper/`):
 //!
 //! - `matrix-store/` — the sqlite state/crypto store the SDK maintains.
-//! - `session.json` — the serialized [`MatrixSession`] (access + refresh
-//!   tokens), created with `0600` permissions. Hardening this into the OS
-//!   keyring is a checkpoint-11 task; the file is at least mode-restricted
-//!   from creation, never a chmod after the fact.
-//! - `store-passphrase` — the crypto-store passphrase (checkpoint 08),
-//!   same `0600` treatment. Generated on first login, read back on every
-//!   restore; deleting it (or reusing the store without it) makes the sqlite
-//!   crypto store unopenable, so `cleanup_files` removes it together with
-//!   the session and store dir. Keyring migration is checkpoint-11.
+//! - keyring entries `session` + `store-passphrase` — the serialized
+//!   [`MatrixSession`] (access + refresh tokens) and the crypto-store
+//!   passphrase (checkpoint 08). The legacy plain files (`session.json`,
+//!   `store-passphrase`) are migrated into the keyring and deleted on first
+//!   touch; when the keyring is unavailable the module falls back to those
+//!   files (`0600`, owner-only from creation) with a loud warning.
 //! - `prefs.json` — device-local application preferences (checkpoint 10),
 //!   versioned + serde-default tolerant. Wiped with the session: preferences
 //!   are device-local by definition, and a fresh device starts fresh.
@@ -33,9 +32,10 @@ use matrix_sdk::{
 use crate::{
     api::ClientError,
     model::{Me, Prefs},
+    secrets::{self, Secret},
 };
 
-fn data_dir() -> Result<PathBuf, ClientError> {
+pub(crate) fn data_dir() -> Result<PathBuf, ClientError> {
     // Honor an explicit override first — tests and dev tooling set this so we
     // never touch the real profile directory.
     if let Some(dir) = std::env::var_os("VESPER_DATA_DIR") {
@@ -43,7 +43,7 @@ fn data_dir() -> Result<PathBuf, ClientError> {
     }
     directories::ProjectDirs::from("dev", "vesper", "vesper")
         .map(|dirs| dirs.data_dir().to_path_buf())
-        .ok_or_else(|| ClientError("Could not determine this platform's data directory".into()))
+        .ok_or_else(|| ClientError::storage("Could not determine this platform's data directory"))
 }
 
 fn store_dir() -> Result<PathBuf, ClientError> {
@@ -83,9 +83,9 @@ pub(crate) fn load_prefs() -> Prefs {
 /// The file is tiny and written only from the settings screen.
 pub(crate) fn save_prefs(prefs: &Prefs) -> Result<(), ClientError> {
     let bytes = serde_json::to_vec(prefs)
-        .map_err(|e| ClientError(format!("Could not serialize preferences: {e}")))?;
+        .map_err(|e| ClientError::storage(format!("Could not serialize preferences: {e}")))?;
     write_owner_only(&prefs_path()?, &bytes)
-        .map_err(|e| ClientError(format!("Could not write preferences: {e}")))
+        .map_err(|e| ClientError::storage(format!("Could not write preferences: {e}")))
 }
 
 /// The state database file name matrix-sdk-sqlite uses inside the store dir
@@ -94,38 +94,37 @@ const STATE_DB_NAME: &str = "matrix-sdk-state.sqlite3";
 
 /// The crypto-store passphrase to open (or create) the sqlite store with.
 ///
-/// Fresh installs: 48 random bytes, hex-encoded, persisted `0600` next to
-/// the session file so restore finds the same passphrase.
+/// Fresh installs: 48 random bytes, hex-encoded, stored in the OS keyring
+/// (file fallback `0600` when the keyring is unavailable — see `secrets`).
 ///
 /// Legacy migration (checkpoint 07 and earlier stores): if the store dir
-/// already contains a state database but no passphrase file does, the store
-/// was created with `None` and its rows are unencrypted — reopening it with
-/// a passphrase would mint a new store cipher and make every existing row
-/// unreadable. Return `None` with a warn so those installs keep working.
-/// Logging out (which deletes the store) and back in upgrades them to a
-/// passphrase-protected store.
+/// already contains a state database but no stored passphrase exists, the
+/// store was created with `None` and its rows are unencrypted — reopening
+/// it with a passphrase would mint a new store cipher and make every
+/// existing row unreadable. Return `None` with a warn so those installs
+/// keep working. Logging out (which deletes the store) and back in upgrades
+/// them to a passphrase-protected store.
 fn store_passphrase() -> Result<Option<String>, ClientError> {
     let path = passphrase_path()?;
-    match std::fs::read_to_string(&path) {
-        Ok(pass) if !pass.trim().is_empty() => Ok(Some(pass.trim().to_string())),
-        _ => {
-            let store_exists = store_dir().map(|dir| dir.join(STATE_DB_NAME).exists()) == Ok(true);
-            if store_exists {
-                tracing::warn!(
-                    "existing crypto store was created without a passphrase; \
-                     continuing unencrypted (logout + login upgrades it)"
-                );
-                return Ok(None);
-            }
-            let mut bytes = [0u8; 48];
-            getrandom::fill(&mut bytes)
-                .map_err(|e| ClientError(format!("Could not generate a store passphrase: {e}")))?;
-            let pass: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            write_owner_only(&path, pass.as_bytes())
-                .map_err(|e| ClientError(format!("Could not write store passphrase: {e}")))?;
-            Ok(Some(pass))
+    if let Some(pass) = secrets::load(Secret::StorePassphrase, &path)? {
+        if !pass.is_empty() {
+            return Ok(Some(pass));
         }
     }
+    let store_exists = store_dir().map(|dir| dir.join(STATE_DB_NAME).exists()) == Ok(true);
+    if store_exists {
+        tracing::warn!(
+            "existing crypto store was created without a passphrase; \
+             continuing unencrypted (logout + login upgrades it)"
+        );
+        return Ok(None);
+    }
+    let mut bytes = [0u8; 48];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| ClientError::storage(format!("Could not generate a store passphrase: {e}")))?;
+    let pass: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    secrets::save(Secret::StorePassphrase, &pass, &path)?;
+    Ok(Some(pass))
 }
 
 const UNREACHABLE: &str =
@@ -145,46 +144,47 @@ fn is_auth_failure(kind: Option<&ErrorKind>) -> bool {
     )
 }
 
-/// Classify an SDK error into a friendly string. Never quotes server text.
+/// Classify an SDK error into a friendly, kind-tagged error. Never quotes
+/// server text — raw errors can carry server responses we don't control.
 fn friendly_error(e: &matrix_sdk::Error) -> ClientError {
     match e {
         matrix_sdk::Error::Http(http_err, ..) => friendly_http_error(http_err.as_ref()),
-        _ => ClientError(GENERIC.into()),
+        _ => ClientError::unknown(GENERIC),
     }
 }
 
 fn friendly_http_error(http_err: &HttpError) -> ClientError {
     match http_err.client_api_error_kind() {
-        Some(ErrorKind::Forbidden) => ClientError("Incorrect username or password.".into()),
+        Some(ErrorKind::Forbidden) => ClientError::auth("Incorrect username or password."),
         Some(ErrorKind::InvalidParam) | Some(ErrorKind::InvalidUsername) => {
-            ClientError("The server didn't recognize that username.".into())
+            ClientError::invalid("The server didn't recognize that username.")
         }
         Some(ErrorKind::UserDeactivated) => {
-            ClientError("This account has been deactivated.".into())
+            ClientError::auth("This account has been deactivated.")
         }
         Some(ErrorKind::UserLocked) | Some(ErrorKind::UserSuspended) => {
-            ClientError("This account is suspended.".into())
+            ClientError::auth("This account is suspended.")
         }
         Some(ErrorKind::LimitExceeded(_)) => {
-            ClientError("Too many attempts — wait a moment and try again.".into())
+            ClientError::rate_limited("Too many attempts — wait a moment and try again.")
         }
         Some(ErrorKind::MissingToken)
         | Some(ErrorKind::UnknownToken(_))
-        | Some(ErrorKind::TokenIncorrect) => ClientError(SIGN_IN_AGAIN.into()),
-        Some(_) => ClientError(GENERIC.into()),
-        None => ClientError(UNREACHABLE.into()),
+        | Some(ErrorKind::TokenIncorrect) => ClientError::auth(SIGN_IN_AGAIN),
+        Some(_) => ClientError::server(GENERIC),
+        None => ClientError::network(UNREACHABLE),
     }
 }
 
 fn map_build_error(e: &ClientBuildError) -> ClientError {
     match e {
         ClientBuildError::InvalidServerName => {
-            ClientError("The homeserver name looks invalid — try e.g. `matrix.org`.".into())
+            ClientError::invalid("The homeserver name looks invalid — try e.g. `matrix.org`.")
         }
         ClientBuildError::AutoDiscovery(_) | ClientBuildError::Http(_) => {
-            ClientError(UNREACHABLE.into())
+            ClientError::network(UNREACHABLE)
         }
-        _ => ClientError("Could not initialize the client.".into()),
+        _ => ClientError::unknown("Could not initialize the client."),
     }
 }
 
@@ -194,7 +194,7 @@ fn map_build_error(e: &ClientBuildError) -> ClientError {
 async fn build_client(homeserver: &str) -> Result<Client, ClientError> {
     let store_dir = store_dir()?;
     std::fs::create_dir_all(&store_dir)
-        .map_err(|e| ClientError(format!("Could not create data directory: {e}")))?;
+        .map_err(|e| ClientError::storage(format!("Could not create data directory: {e}")))?;
 
     // Checkpoint 08: the sqlite store (state + crypto) is passphrase-locked
     // when created fresh; see [`store_passphrase`] for the legacy branch.
@@ -218,13 +218,13 @@ async fn build_client(homeserver: &str) -> Result<Client, ClientError> {
         .map_err(|e| map_build_error(&e))
 }
 
-fn write_session_file(session: &MatrixSession) -> Result<(), ClientError> {
+/// Persist the session blob into the OS keyring (file fallback with a loud
+/// warning; any legacy `session.json` is removed — checkpoint 11).
+fn save_session(session: &MatrixSession) -> Result<(), ClientError> {
     let path = session_path()?;
-    let bytes = serde_json::to_vec(session)
-        .map_err(|e| ClientError(format!("Could not serialize session: {e}")))?;
-    write_owner_only(&path, &bytes)
-        .map_err(|e| ClientError(format!("Could not write session file: {e}")))?;
-    Ok(())
+    let json = serde_json::to_string(session)
+        .map_err(|e| ClientError::storage(format!("Could not serialize session: {e}")))?;
+    secrets::save(Secret::Session, &json, &path)
 }
 
 /// Write `bytes` to `path` readable only by the owner from the moment the
@@ -303,7 +303,7 @@ pub async fn connect_login(
         .map_err(|e| friendly_error(&e))?;
 
     if let Some(session) = client.matrix_auth().session() {
-        write_session_file(&session)?;
+        save_session(&session)?;
     }
 
     let me = me_snapshot(&client).await;
@@ -321,14 +321,16 @@ pub async fn connect_login(
 /// rather than orphaning it. `App` turns either `Err` into the login screen
 /// (with a warn log), never a panic.
 pub async fn connect_restore() -> Result<Option<(Client, Me)>, ClientError> {
-    let bytes = match std::fs::read(session_path()?) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(ClientError(format!("Could not read session file: {e}"))),
+    // Keyring first; a legacy `session.json` is migrated + deleted inside
+    // `secrets::load` (checkpoint 11). `None` = fresh install / clean
+    // logout — the normal no-session state, not an error.
+    let json = secrets::load(Secret::Session, &session_path()?)?;
+    let Some(json) = json else {
+        return Ok(None);
     };
-    let session: MatrixSession = serde_json::from_slice(&bytes).map_err(|_| {
+    let session: MatrixSession = serde_json::from_str(&json).map_err(|_| {
         cleanup_files();
-        ClientError("Stored session could not be read — please sign in again.".into())
+        ClientError::storage("Stored session could not be read — please sign in again.")
     })?;
 
     let homeserver = session.meta.user_id.server_name().to_string();
@@ -347,7 +349,7 @@ pub async fn connect_restore() -> Result<Option<(Client, Me)>, ClientError> {
 
     // Tokens may have rotated during restore; rewrite the file so it stays fresh.
     if let Some(fresh) = client.matrix_auth().session() {
-        let _ = write_session_file(&fresh);
+        let _ = save_session(&fresh);
     }
 
     let me = me_snapshot(&client).await;
@@ -379,6 +381,12 @@ pub async fn logout(client: Option<Client>) -> Result<(), ClientError> {
 }
 
 fn cleanup_files() {
+    // Keyring entries die with the session too (checkpoint 11): a stale
+    // entry must never resurrect a logged-out device's tokens.
+    if let (Ok(session), Ok(pass)) = (session_path(), passphrase_path()) {
+        secrets::delete(Secret::Session, &session);
+        secrets::delete(Secret::StorePassphrase, &pass);
+    }
     let mut paths = vec![session_path(), passphrase_path(), prefs_path(), store_dir()];
     for result in paths.drain(..) {
         let Ok(path) = result else { continue };
@@ -440,7 +448,11 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("VESPER_DATA_DIR", dir.path());
+        // Tests never touch the real OS keychain: force the file fallback
+        // (checkpoint 11) so keyring-backed paths are exercised on-device.
+        std::env::set_var("VESPER_SECRET_STORE", "file");
         let out = f(dir.path());
+        std::env::remove_var("VESPER_SECRET_STORE");
         std::env::remove_var("VESPER_DATA_DIR");
         out
     }
@@ -452,6 +464,33 @@ pub(crate) mod tests {
             assert!(first.is_some(), "fresh install gets a passphrase");
             let second = store_passphrase().expect("read back");
             assert_eq!(first, second, "restore must reuse the stored passphrase");
+        });
+    }
+
+    // Checkpoint 11: a checkpoint-08/10 install kept the passphrase in a
+    // plain file — the first open after upgrade must keep using that exact
+    // value (a fresh one would brick the crypto store).
+    #[test]
+    fn legacy_passphrase_file_is_reused_verbatim() {
+        with_data_dir(|_| {
+            write_owner_only(&passphrase_path().expect("path"), b"legacy-secret-value\n")
+                .expect("legacy write");
+            let pass = store_passphrase().expect("read");
+            assert_eq!(
+                pass.as_deref(),
+                Some("legacy-secret-value"),
+                "the stored passphrase must survive the secrets migration"
+            );
+        });
+    }
+
+    #[test]
+    fn cleanup_removes_stored_passphrase() {
+        with_data_dir(|_| {
+            store_passphrase().expect("generate");
+            assert!(passphrase_path().expect("path").exists());
+            cleanup_files();
+            assert!(!passphrase_path().expect("path").exists());
         });
     }
 

@@ -101,3 +101,17 @@ underneath.
 > Update DiscoveryModal with debounced search, load-more paging, and join
 > button states. Keep MockClient fixtures query/pagination-aware for offline
 > UI work.
+
+## Implemented / Deviations (retrospective footer)
+
+**Implemented**: public room directory browse/search (paginated), public
+space directory, room join by id/alias with rate-limit + invite-only
+error mapping, leave-room, spaces rail grouping rooms by `m.space.child`
+order (one level).
+
+**Deviations**:
+- Space summaries are cached per room in the sync task; a diff carrying a
+  space re-maps only that space, and room→space grouping refreshes only
+  rooms whose membership actually moved (checkpoint 11 §C).
+- The directory's server-side `m.space` filter falls back to client-side
+  filtering on older servers exactly as planned.

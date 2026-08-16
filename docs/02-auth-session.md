@@ -100,3 +100,23 @@ work.
 > LoginScreen (homeserver field + inline errors) and Settings (logout row).
 > App must restore the session on relaunch. Verify with a matrix.org test
 > account. Never log credentials.
+
+## Implemented / Deviations (retrospective footer)
+
+**Implemented** as designed: password login with well-known discovery,
+`MatrixSession` persistence + restore-across-restart, logout (remote +
+local wipe), `VESPER_BACKEND=mock` switch, friendly fixed-sentence error
+mapping (never raw server text).
+
+**Deviations**:
+- **Tokens moved off disk (checkpoint 11).** `session.json` is gone; the
+  session blob lives in the OS keyring (service `dev.vesper.app`), with a
+  `0600` file fallback + loud warning where no keyring exists. First
+  launch after upgrade migrates the old file into the keyring and deletes
+  it. See `packages/client/src/secrets.rs`.
+- Errors are no longer a bare string: `ClientError` carries a
+  `ClientErrorKind` (auth/network/rate-limited/…) consumed by the toast
+  center (checkpoint 11 workstream A). Fixed sentences unchanged.
+- Restore failures fall through to the login screen with a warning log
+  instead of surfacing an error dialog — a stale session is not a
+  recoverable error state for the user.

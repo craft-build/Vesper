@@ -3,7 +3,26 @@ use dioxus::prelude::*;
 
 use crate::chat::{AppShell, ChatUiState, ChatView, DiscoveryModal};
 use crate::data::{self, ClientState, Convo, Me};
+use crate::design_system::ToastCenter;
 use crate::screens::{LoginScreen, SettingsScreen};
+
+#[cfg(not(target_arch = "wasm32"))]
+use client::diagnostics::Screen;
+
+// wasm has no diagnostics module (client builds feature-free there); a
+// local mirror keeps the call sites identical across targets.
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+enum Screen {
+    #[allow(dead_code)]
+    Home,
+    #[allow(dead_code)]
+    Room,
+    #[allow(dead_code)]
+    Settings,
+    #[allow(dead_code)]
+    Login,
+}
 
 const STYLES: Asset = asset!("/assets/vesper/styles.css");
 
@@ -29,6 +48,9 @@ pub fn App() -> Element {
     use_context_provider(|| client.clone());
     use_context_provider(ChatUiState::new);
     let mut me = use_context_provider(|| Signal::new(Option::<Me>::None));
+    // The single toast surface (checkpoint 11): errors from anywhere push
+    // here; `ToastHost` below the router renders them.
+    ToastCenter::provide();
 
     // Live backend state, written by sync tasks that run on the Matrix
     // runtime thread. These MUST be sync-storage signals: the default
@@ -92,7 +114,17 @@ pub fn App() -> Element {
         move || {
             let client = client.clone();
             async move {
+                // The elapsed log is the store-open half of the cold-start
+                // budget (checkpoint 11 §C: <3s to interactive on a warm
+                // store; the launcher logs the pre-launch half).
+                let started = std::time::Instant::now();
                 let result = client.restore().await;
+                tracing::info!(
+                    target: "vesper_startup",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    has_session = matches!(&result, Ok(Some(_))),
+                    "session restore finished"
+                );
                 match &result {
                     Ok(Some(restored)) => me.set(Some(restored.clone())),
                     Ok(None) => {}
@@ -112,9 +144,11 @@ pub fn App() -> Element {
         } else if me().is_some() {
             Router::<Route> {}
         } else {
+            { track_screen(Screen::Login); }
             LoginScreen { on_login: move |m| me.set(Some(m)) }
         }
         crate::window_chrome::ResizeBorders {}
+        crate::design_system::ToastHost {}
     }
 }
 
@@ -219,6 +253,7 @@ fn Shell() -> Element {
 
 #[component]
 fn Home() -> Element {
+    track_screen(Screen::Home);
     rsx! {
         ChatView {}
     }
@@ -226,6 +261,9 @@ fn Home() -> Element {
 
 #[component]
 fn RoomView(room_id: String) -> Element {
+    // Only the screen *name* is recorded — never the room id or any
+    // content (checkpoint 11 §D).
+    track_screen(Screen::Room);
     rsx! {
         ChatView { room_id }
     }
@@ -234,7 +272,18 @@ fn RoomView(room_id: String) -> Element {
 #[component]
 fn SettingsPage() -> Element {
     let navigator = use_navigator();
+    track_screen(Screen::Settings);
     rsx! {
         SettingsScreen { on_close: move |_| { navigator.push(Route::Home {}); } }
     }
 }
+
+/// Record the coarse screen for panic dumps (native only: the diagnostics
+/// module lives behind the client crate's `matrix` feature; wasm no-ops).
+#[cfg(not(target_arch = "wasm32"))]
+fn track_screen(screen: client::diagnostics::Screen) {
+    client::diagnostics::set_last_screen(screen);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn track_screen(_screen: Screen) {}

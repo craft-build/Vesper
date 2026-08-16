@@ -95,3 +95,117 @@ web target.
 > web file + notification APIs) and either land it or record the deferral in
 > this doc. Finish by sweeping packages/client for unimplemented!/todo!()
 > stubs and adding Implemented/Deviations footers to every checkpoint doc.
+
+## Implemented / Deviations
+
+### A. Error taxonomy & surfaces — implemented
+
+- `ClientError` is now `{ kind: ClientErrorKind, message }` with kinds
+  Network / Auth / RateLimited / Invalid / Server / Storage / Unsupported
+  / Unknown (`packages/client/src/api.rs`); every constructor site in
+  `client` and the mock classifies, HTTP errors map through
+  `ErrorKind` (Forbidden→Auth, LimitExceeded→RateLimited, etc.).
+- `ToastCenter` (`packages/ui/src/design_system/toast_center.rs`):
+  App-scoped, provided once, rendered by a single `ToastHost` — kind picks
+  tone + title. Settings saves/toggles/avatar, downloads, and logout
+  failures route through it; form-adjacent errors (login fields, dialog
+  password prompts) stay inline.
+- Reconnect pill: already fed by the 03 `connecting` signal; unchanged.
+
+### B. Secrets in the keyring — implemented
+
+- `packages/client/src/secrets.rs`: keyring v4 (`v1` mode + apple/windows
+  native stores, target-gated; Linux deliberately file-fallback), service
+  `dev.vesper.app`, entries `session` + `store-passphrase`.
+- One-time migration both directions: legacy `session.json` /
+  `store-passphrase` files are hoisted into the keyring and deleted on
+  first touch (read or save); `cleanup_files` (logout) deletes keyring
+  entries too. Tests force the file backend via `VESPER_SECRET_STORE=file`.
+- `grep -r access_token <data_dir>` is clean after one launch post-upgrade
+  (the only writer of that JSON was the session file, now keyring-only).
+
+### C. Performance — implemented (scoped)
+
+- Media cache: Vesper-owned on-disk LRU (`media_cache.rs`, 500 MB default
+  cap, mtime-based eviction, atomic writes) replacing the SDK's unevicted
+  sqlite media store (`use_cache = false`); in-memory data-URI map capped
+  at 192 MB FIFO in `use_media_src`; Settings → General gained the
+  size + Clear row (bytes freed surfaced as a toast).
+- Room list: diff batches pair `RoomListItem`s with mapped `Convo`s —
+  O(batch) remaps (was: full-list remap incl. per-room store lookups per
+  batch); DM presence dots refresh via a changed-presence dirty set;
+  space-membership moves remap only affected rooms. Regression test keeps
+  pairs index-aligned.
+- Timeline: rendered-rows cap (newest 800, older-rows notice) as the
+  virtualization sanity check; timelines open at a ~30-event page and grow
+  only through explicit back-pagination.
+- Cold start: `vesper_startup` spans (launcher init + handoff, session
+  restore incl. store open) so regressions against the <3 s budget are
+  visible in any log. True 10k-event-room profiling with Instruments and
+  viewport virtualization remain open follow-ups (capping makes them
+  non-blocking for release).
+
+### D. Diagnostics — implemented
+
+- `tracing-appender` rolling daily files in `<data_dir>/logs/`
+  (stdout layer kept for `dx serve`), `RUST_LOG` respected.
+- Panic hook logs payload + location + coarse last-screen name (never
+  message content) to `vesper_panic` target, then defers to the default
+  hook. Route changes record the screen name via `client::diagnostics`.
+- Settings → SUPPORT → Copy: app/OS/screen/secrets-backend facts + tail
+  (250 lines) of the newest log, token-shaped values redacted, MXIDs/room
+  ids kept per policy; clipboard via the webview's async clipboard API.
+
+### E. Packaging — implemented (macOS first)
+
+- `packages/desktop/Dioxus.toml`: bundle id `dev.vesper.app`, publisher,
+  category SocialNetworking, descriptions, app icon (1024px
+  `assets/icon.png` + `assets/icon.icns`, embedded as `CFBundleIconFile`;
+  regeneration script `scripts/make-icns.sh`). The desktop crate is named
+  `vesper` — the binary name titles the `.app` (a crate named `desktop`
+  would ship "Desktop.app").
+- `dx bundle --platform desktop --release` produces `Vesper.app` — ad-hoc
+  signed, verified to launch standalone (smoke run confirmed the rolling
+  log + `vesper_startup` spans: init 2 ms, session-restore 2 ms on the
+  no-session path — far inside the <3 s budget). Deliverable copied to
+  `packages/desktop/dist/Vesper.app`.
+- The bundler's **DMG step fails in this environment** (`hdiutil create:
+  Directory not empty`, reproducible with a trivial folder — an
+  environment-level hdiutil problem, not a bundle defect; DMG creation
+  deferred until the tool works here). Windows/Linux bundling documented
+  follow-ups; auto-update out of scope for this release.
+
+### F. Web target — DEFERRED (decision recorded)
+
+Decision: **defer the real-backend web port**; the release ships desktop
+only. Rationale:
+
+- The trait seam stays web-green: `ui` and `web` compile for
+  `wasm32-unknown-unknown` with the mock backend (verified), so the
+  deferral costs nothing structurally.
+- The real port needs matrix-sdk `indexeddb`+`js` feature wiring under a
+  `wasm32` client path, blob-URL media, web file/notification API swaps,
+  and a wasm executor bridge — a real risk of subtle dual-target rot in
+  the runtime bridge for less than a day of spike budget remaining after
+  A–E.
+- Blockers list (picked up when revisited): `client` crate needs a
+  `#[cfg(target_arch = "wasm32")]` implementation of `VesperClient`
+  against matrix-sdk indexeddb; `media_uri` already returns `data:` URIs
+  (no path assumptions to fix); `rfd`/`notify-rust` call sites are
+  already native-cfg-gated; secrets module needs a web-appropriate store
+  (or a documented no-persistence mode) since OS keyrings don't exist.
+
+### Acceptance criteria status
+
+- [x] Offline browse + queued sends — verified in checkpoint 04/06 flows
+      (SDK send queue + offline sync mode); re-verified on next manual soak.
+- [x] Keyring storage with migration; no `access_token` in data dir.
+- [x] Log file + panic capture + diagnostics export button.
+- [x] Desktop bundle builds + launches standalone (macOS `.app`,
+      ad-hoc signed, icon embedded; `.dmg` deferred on an environment
+      hdiutil failure — see §E).
+- [x] Web: documented deferral (§F above).
+- [x] No `todo!`/`unimplemented!` in `packages/client` (grep clean).
+- [x] Checkpoint docs carry Implemented/Deviations footers.
+- [ ] 24h soak — inherently a human run; everything it checks (bounded
+      caches, O(batch) diffs, panic capture) is instrumented for it.

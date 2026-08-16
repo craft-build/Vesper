@@ -137,7 +137,7 @@ pub fn DiscoveryModal(on_close: EventHandler<()>) -> Element {
                         spaces.set(items);
                         spaces_next.set(next);
                     }
-                    Err(e) => error.set(Some(e.0)),
+                    Err(e) => error.set(Some(e.message)),
                 }
             });
         });
@@ -193,7 +193,7 @@ pub fn DiscoveryModal(on_close: EventHandler<()>) -> Element {
                         spaces.write().extend(items);
                         spaces_next.set(next);
                     }
-                    Err(e) => error.set(Some(e.0)),
+                    Err(e) => error.set(Some(e.message)),
                 }
             });
         }
@@ -207,7 +207,7 @@ pub fn DiscoveryModal(on_close: EventHandler<()>) -> Element {
             spawn(async move {
                 let state = match client.join_room(&id).await {
                     Ok(()) => JoinRow::Joined,
-                    Err(e) => JoinRow::Failed(e.0),
+                    Err(e) => JoinRow::Failed(e.message),
                 };
                 join_rows.write().insert(id, state);
             });

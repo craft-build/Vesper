@@ -103,3 +103,16 @@ this checkpoint.
 > running app must be unchanged (still MockClient). Show the final root
 > Cargo.toml and new crate layout, and prove `cargo check --workspace` and
 > `dx serve --platform desktop` succeed.
+
+## Implemented / Deviations (retrospective footer)
+
+**Implemented**: five-crate workspace (`ui` / `client` / `desktop` /
+`web` / `mobile`), the `VesperClient` trait seam keeping matrix-sdk out
+of the UI crate, mock backend co-existing with the real client, shared
+workspace deps.
+
+**Deviations**: none structural. The seam proved durable through
+checkpoints 02–11; the only addition is `ClientErrorKind` inside the
+existing `ClientError` (checkpoint 11 §A) and wasm-conditional client
+features (`matrix` off under `wasm32`), both anticipated by the
+"feature-free seam" rule.

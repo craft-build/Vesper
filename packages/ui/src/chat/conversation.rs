@@ -278,7 +278,9 @@ pub fn Conversation(
                 let dest = None::<String>;
                 let _ = suggested; // suppress unused on wasm
                 let Some(dest) = dest else { return };
-                let _ = client.save_attachment(&convo_id, attachment, dest).await;
+                if let Err(e) = client.save_attachment(&convo_id, attachment, dest).await {
+                    use_context::<crate::design_system::ToastCenter>().error(&e);
+                }
             });
         }
     };
@@ -343,6 +345,17 @@ pub fn Conversation(
         .get(&convo_id)
         .cloned()
         .unwrap_or_else(|| messages());
+
+    // Rendered-rows cap (checkpoint 11 §C virtualization sanity check):
+    // timelines open at one ~30-event page and grow only through explicit
+    // back-pagination, but a pathological room (10k events of auto-loaded
+    // history) would DOM-mount every row. Rendering keeps the newest
+    // RENDER_CAP rows — far above any hand-scrolled session, bounded for
+    // the machine. True viewport virtualization stays future work (noted
+    // in docs/11).
+    const RENDER_CAP: usize = 800;
+    let hidden = msgs.len().saturating_sub(RENDER_CAP);
+    let visible = &msgs[hidden.min(msgs.len())..];
 
     // Content-driven scroll behavior. The reactive reads all happen INSIDE
     // this callback — that's what makes the effect re-run on each publish
@@ -498,7 +511,12 @@ pub fn Conversation(
                 if loading_older() {
                     div { style: "text-align:center;font-size:12px;color:var(--text-tertiary);font-family:var(--font-mono);padding:4px 0;", "Loading older…" }
                 }
-                for m in msgs.iter() {
+                if hidden > 0 {
+                    div { style: "text-align:center;font-size:12px;color:var(--text-tertiary);font-family:var(--font-mono);padding:4px 0;",
+                        "{hidden} older loaded messages hidden from this view"
+                    }
+                }
+                for m in visible.iter() {
                     MessageRow {
                         key: "{m.id}",
                         m: m.clone(),

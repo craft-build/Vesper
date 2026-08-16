@@ -268,6 +268,16 @@ pub enum Command {
         prefs: crate::model::Prefs,
         reply: oneshot::Sender<Result<(), ClientError>>,
     },
+    /// Bytes used by the on-disk media cache (checkpoint 11 §C). Local
+    /// files, cheap: answered from a spawned task (the dir walk).
+    MediaCacheBytes {
+        reply: oneshot::Sender<u64>,
+    },
+    /// Delete every cached media entry; replies with the bytes freed
+    /// (checkpoint 11 §C settings action).
+    ClearMediaCache {
+        reply: oneshot::Sender<Result<u64, ClientError>>,
+    },
 }
 
 /// Post-login send-queue setup (checkpoint 05): make sure the global send
@@ -359,7 +369,7 @@ async fn restart_sync(
     match sync::start_room_list(client.clone(), bound.state, &bound.snapshot, &bound.spaces).await {
         Ok(handles) => *current = Some(handles),
         Err(e) => {
-            tracing::warn!("room list sync failed to start: {}", e.0);
+            tracing::warn!("room list sync failed to start: {}", e);
             // Don't strand the user at a permanently empty list: leave the
             // "connecting…" pill on so a non-delivering sync reads as one.
             let mut state = bound.state;
@@ -460,7 +470,7 @@ async fn set_display_name(client: &Client, name: &str) -> Result<Me, ClientError
         .account()
         .set_display_name(Some(name))
         .await
-        .map_err(|_| ClientError("Could not save your display name.".into()))?;
+        .map_err(|_| ClientError::server("Could not save your display name."))?;
     Ok(session::me_snapshot(client).await)
 }
 
@@ -470,21 +480,21 @@ async fn set_display_name(client: &Client, name: &str) -> Result<Me, ClientError
 async fn set_avatar(client: &Client, path: &str) -> Result<Me, ClientError> {
     let bytes = tokio::fs::read(path)
         .await
-        .map_err(|_| ClientError("Could not read the chosen image.".into()))?;
+        .map_err(|_| ClientError::storage("Could not read the chosen image."))?;
     let kind = infer::get(&bytes)
-        .ok_or_else(|| ClientError("That file does not look like an image.".into()))?;
+        .ok_or_else(|| ClientError::invalid("That file does not look like an image."))?;
     let mime: mime::Mime = kind
         .mime_type()
         .parse()
-        .map_err(|_| ClientError("Unsupported image type.".into()))?;
+        .map_err(|_| ClientError::invalid("Unsupported image type."))?;
     if mime.type_() != mime::IMAGE {
-        return Err(ClientError("Avatars must be images.".into()));
+        return Err(ClientError::invalid("Avatars must be images."));
     }
     client
         .account()
         .upload_avatar(&mime, bytes)
         .await
-        .map_err(|_| ClientError("Could not upload the image.".into()))?;
+        .map_err(|_| ClientError::server("Could not upload the image."))?;
     Ok(session::me_snapshot(client).await)
 }
 
@@ -525,14 +535,14 @@ async fn set_notification_toggle(
     enabled: bool,
 ) -> Result<Vec<crate::model::NotifToggle>, ClientError> {
     let Some(def) = crate::notifications::toggle_def(toggle_id) else {
-        return Err(ClientError("Unknown notification setting.".into()));
+        return Err(ClientError::invalid("Unknown notification setting."));
     };
     let settings = client.notification_settings().await;
     for rule in def.rules {
         settings
             .set_push_rule_enabled(map_rule_kind(rule.kind), rule.rule_id, enabled)
             .await
-            .map_err(|_| ClientError("Could not save that notification setting.".into()))?;
+            .map_err(|_| ClientError::server("Could not save that notification setting."))?;
     }
     notification_toggles(client).await
 }
@@ -768,8 +778,8 @@ impl ClientRuntime {
                                             let _ = reply.send(Ok(()));
                                         }
                                         None => {
-                                            let _ = reply.send(Err(ClientError(
-                                                "That conversation is not open.".into(),
+                                            let _ = reply.send(Err(ClientError::invalid(
+                                                "That conversation is not open."
                                             )));
                                         }
                                     }
@@ -785,7 +795,7 @@ impl ClientRuntime {
                                 // are network fetches and the command loop is
                                 // sequential (checkpoint-06 lesson).
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 tokio::spawn(async move {
@@ -805,7 +815,7 @@ impl ClientRuntime {
                                 reply,
                             } => {
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 tokio::spawn(async move {
@@ -927,13 +937,13 @@ impl ClientRuntime {
                             }
                             Command::FetchDevices { reply } => {
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 tokio::spawn(async move {
                                     let result = fetch_devices(&client).await.map_err(|e| {
                                         tracing::warn!("devices fetch failed: {e:?}");
-                                        ClientError("Could not load sessions.".into())
+                                        ClientError::server("Could not load sessions.")
                                     });
                                     let _ = reply.send(result);
                                 });
@@ -947,7 +957,7 @@ impl ClientRuntime {
                                 // round-trips and the command loop is
                                 // sequential (checkpoint-06 lesson).
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 tokio::spawn(async move {
@@ -962,7 +972,7 @@ impl ClientRuntime {
                                 reply,
                             } => {
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 tokio::spawn(async move {
@@ -974,7 +984,7 @@ impl ClientRuntime {
                             }
                             Command::JoinRoom { id_or_alias, reply } => {
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 tokio::spawn(async move {
@@ -984,7 +994,7 @@ impl ClientRuntime {
                             }
                             Command::LeaveRoom { room_id, reply } => {
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 tokio::spawn(async move {
@@ -996,13 +1006,13 @@ impl ClientRuntime {
                                 // Empty would *remove* the name server-side;
                                 // the UI also guards, the backend enforces.
                                 if name.trim().is_empty() {
-                                    let _ = reply.send(Err(ClientError(
-                                        "Display name cannot be empty.".into(),
+                                    let _ = reply.send(Err(ClientError::invalid(
+                                        "Display name cannot be empty.",
                                     )));
                                     continue;
                                 }
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 let me_slot = me_cache.clone();
@@ -1017,7 +1027,7 @@ impl ClientRuntime {
                             }
                             Command::SetAvatar { path, reply } => {
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 let me_slot = me_cache.clone();
@@ -1036,7 +1046,7 @@ impl ClientRuntime {
                                 reply,
                             } => {
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 tokio::spawn(async move {
@@ -1047,7 +1057,7 @@ impl ClientRuntime {
                                         .await
                                         .map(|_| ())
                                         .map_err(|_| {
-                                            ClientError("Could not rename that session.".into())
+                                            ClientError::server("Could not rename that session.")
                                         });
                                     let _ = reply.send(result);
                                 });
@@ -1058,7 +1068,7 @@ impl ClientRuntime {
                                 reply,
                             } => {
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 // Deleting the current device is refused —
@@ -1067,8 +1077,8 @@ impl ClientRuntime {
                                 if Some(&device_id)
                                     == client.device_id().map(|d| d.to_string()).as_ref()
                                 {
-                                    let _ = reply.send(Err(ClientError(
-                                        "Sign out instead of deleting this session.".into(),
+                                    let _ = reply.send(Err(ClientError::invalid(
+                                        "Sign out instead of deleting this session.",
                                     )));
                                     continue;
                                 }
@@ -1082,7 +1092,7 @@ impl ClientRuntime {
                             }
                             Command::NotificationRules { reply } => {
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 tokio::spawn(async move {
@@ -1096,7 +1106,7 @@ impl ClientRuntime {
                                 reply,
                             } => {
                                 let Some(client) = sdk_client.clone() else {
-                                    let _ = reply.send(Err(ClientError("Not signed in.".into())));
+                                    let _ = reply.send(Err(ClientError::auth("Not signed in.")));
                                     continue;
                                 };
                                 tokio::spawn(async move {
@@ -1111,6 +1121,18 @@ impl ClientRuntime {
                             }
                             Command::SetPrefs { prefs, reply } => {
                                 let _ = reply.send(session::save_prefs(&prefs));
+                            }
+                            Command::MediaCacheBytes { reply } => {
+                                // Local dir walk: off the loop, like every
+                                // other filesystem-heavy op.
+                                tokio::task::spawn_blocking(move || {
+                                    let _ = reply.send(crate::media_cache::size_bytes());
+                                });
+                            }
+                            Command::ClearMediaCache { reply } => {
+                                tokio::task::spawn_blocking(move || {
+                                    let _ = reply.send(crate::media_cache::clear());
+                                });
                             }
                         }
                     }
@@ -1172,6 +1194,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("VESPER_DATA_DIR", tmp.path());
+        // Never touch the real keychain from tests (checkpoint 11).
+        std::env::set_var("VESPER_SECRET_STORE", "file");
 
         let (runtime, tx) = ClientRuntime::spawn();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1187,13 +1211,14 @@ mod tests {
             .expect("login reply")
             .expect_err("login must fail");
         assert!(
-            err.0.contains("homeserver") || err.0.contains("client"),
+            err.message.contains("homeserver") || err.message.contains("client"),
             "unexpected error text: {}",
-            err.0
+            err.message
         );
         drop(tx);
         runtime.join().expect("runtime thread exits cleanly");
         drop(_guard);
+        std::env::remove_var("VESPER_SECRET_STORE");
         std::env::remove_var("VESPER_DATA_DIR");
     }
 
@@ -1207,6 +1232,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("VESPER_DATA_DIR", tmp.path());
+        std::env::set_var("VESPER_SECRET_STORE", "file");
 
         let (runtime, tx) = ClientRuntime::spawn();
         let fresh = crate::model::Prefs {
@@ -1231,6 +1257,7 @@ mod tests {
         drop(tx);
         runtime.join().expect("runtime thread exits cleanly");
         drop(_guard);
+        std::env::remove_var("VESPER_SECRET_STORE");
         std::env::remove_var("VESPER_DATA_DIR");
     }
 }

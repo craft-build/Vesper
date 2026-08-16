@@ -45,7 +45,7 @@ async fn directory_chunk(
     let response = client
         .public_rooms_filtered(request)
         .await
-        .map_err(|e| ClientError(format!("Directory search failed: {e}")))?;
+        .map_err(|e| ClientError::server(format!("Directory search failed: {e}")))?;
     Ok((response.chunk, response.next_batch))
 }
 
@@ -135,7 +135,7 @@ fn chunk_to_space(chunk: &PublicRoomsChunk) -> PublicSpace {
 /// the modal can show an inline, retryable message.
 pub async fn join_room(client: &Client, id_or_alias: &str) -> Result<(), ClientError> {
     let target: OwnedRoomOrAliasId = RoomOrAliasId::parse(id_or_alias)
-        .map_err(|_| ClientError(format!("“{id_or_alias}” is not a room id or alias.")))?;
+        .map_err(|_| ClientError::invalid(format!("“{id_or_alias}” is not a room id or alias.")))?;
     match client.join_room_by_id_or_alias(&target, &[]).await {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -154,13 +154,13 @@ pub async fn join_room(client: &Client, id_or_alias: &str) -> Result<(), ClientE
 /// UI can surface (the room-list stream is the source of truth for removal).
 pub async fn leave_room(client: &Client, room_id: &str) -> Result<(), ClientError> {
     let room_id = matrix_sdk::ruma::RoomId::parse(room_id)
-        .map_err(|_| ClientError(format!("“{room_id}” is not a room id.")))?;
+        .map_err(|_| ClientError::invalid(format!("“{room_id}” is not a room id.")))?;
     let Some(room) = client.get_room(&room_id) else {
-        return Err(ClientError("That room isn't in your list anymore.".into()));
+        return Err(ClientError::invalid("That room isn't in your list anymore."));
     };
     room.leave()
         .await
-        .map_err(|e| ClientError(format!("Could not leave the room: {e}")))
+        .map_err(|e| ClientError::server(format!("Could not leave the room: {e}")))
 }
 
 /// Whether the target (a room id or alias) resolves to a room we're joined
@@ -190,13 +190,13 @@ fn join_error(err: &matrix_sdk::Error) -> ClientError {
                 }
                 _ => " Try again in a moment.".into(),
             };
-            ClientError(format!(
+            ClientError::rate_limited(format!(
                 "Rate limited — you're joining rooms too fast.{hint}"
             ))
         }
         Some(ErrorKind::Forbidden) => {
-            ClientError("You can't join that room (invite-only?).".into())
+            ClientError::auth("You can't join that room (invite-only?).")
         }
-        _ => ClientError(format!("Could not join: {err}")),
+        _ => ClientError::server(format!("Could not join: {err}")),
     }
 }

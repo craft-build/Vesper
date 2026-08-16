@@ -15,15 +15,21 @@ pub mod notifications;
 pub mod uiaa;
 
 #[cfg(feature = "matrix")]
+pub mod diagnostics;
+#[cfg(feature = "matrix")]
 pub mod directory;
 #[cfg(feature = "matrix")]
 pub mod live;
 #[cfg(feature = "matrix")]
 pub mod media;
 #[cfg(feature = "matrix")]
+pub mod media_cache;
+#[cfg(feature = "matrix")]
 pub mod runtime;
 #[cfg(feature = "matrix")]
-mod session;
+mod secrets;
+#[cfg(feature = "matrix")]
+pub mod session;
 #[cfg(feature = "matrix")]
 pub mod sync;
 #[cfg(feature = "matrix")]
@@ -86,10 +92,10 @@ mod matrix_impl {
             let (reply_tx, reply_rx) = oneshot::channel();
             self.tx
                 .send(build(reply_tx))
-                .map_err(|_| ClientError("The Matrix runtime is not running.".into()))?;
+                .map_err(|_| ClientError::unknown("The Matrix runtime is not running."))?;
             reply_rx
                 .await
-                .map_err(|_| ClientError("The Matrix runtime stopped responding.".into()))?
+                .map_err(|_| ClientError::unknown("The Matrix runtime stopped responding."))?
         }
     }
 
@@ -180,7 +186,7 @@ mod matrix_impl {
             })
             .await
             .unwrap_or_else(|e| {
-                tracing::warn!("thread: {}", e.0);
+                tracing::warn!("thread: {}", e);
                 Vec::new()
             })
         }
@@ -228,7 +234,7 @@ mod matrix_impl {
                 })
                 .await
             {
-                tracing::warn!("send_thread_reply: {}", e.0);
+                tracing::warn!("send_thread_reply: {}", e);
             }
             ThreadReply {
                 from: String::new(),
@@ -246,7 +252,7 @@ mod matrix_impl {
             })
             .await
             .unwrap_or_else(|e| {
-                tracing::warn!("react: {}", e.0);
+                tracing::warn!("react: {}", e);
                 Vec::new()
             })
         }
@@ -304,7 +310,7 @@ mod matrix_impl {
             self.ask(|reply| Command::FetchDevices { reply })
                 .await
                 .unwrap_or_else(|e| {
-                    tracing::warn!("devices: {}", e.0);
+                    tracing::warn!("devices: {}", e);
                     Vec::new()
                 })
         }
@@ -436,6 +442,18 @@ mod matrix_impl {
         async fn set_prefs(&self, prefs: Prefs) -> Result<(), ClientError> {
             self.ask(move |reply| Command::SetPrefs { prefs, reply })
                 .await
+        }
+
+        // Checkpoint 11: media cache size + clear for the settings row.
+        async fn media_cache_bytes(&self) -> u64 {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            match self.tx.send(Command::MediaCacheBytes { reply: reply_tx }) {
+                Ok(()) => reply_rx.await.unwrap_or(0),
+                Err(_) => 0,
+            }
+        }
+        async fn clear_media_cache(&self) -> Result<u64, ClientError> {
+            self.ask(|reply| Command::ClearMediaCache { reply }).await
         }
     }
 }
