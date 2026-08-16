@@ -52,7 +52,10 @@ new messages in background rooms.
   `Signal<BTreeMap<String, Presence>>` in `ClientState`; ProfilePanel maps
   MXID → dot. Presence on Matrix.org can be sparse — if a contact shows
   "unknown", render Offline but log `debug` (documented known limitation,
-  not a bug).
+  not a bug). *(Later amendment: MSC4186 simplified sliding sync has no
+  presence extension at all, so the event handler never fires — presence is
+  populated by polling `GET /presence/{userId}/status` for DM counterparts
+  in `client/src/live.rs`, and the nav drawer reads the live map directly.)*
 - **Notifications**: background task listens to the same room-list/latest-
   events stream; notify only when (a) app window unfocused (`document::eval`
   visibility/focus check cached in a signal), (b) room not currently open,

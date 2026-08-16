@@ -7,11 +7,11 @@
 //! Leaving is a right-click away: a context menu on any row offers "Leave
 //! room". The ⌘K switcher stays flat over all rooms.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use dioxus::prelude::*;
 
-use crate::data::{Convo, Presence, Space};
+use crate::data::{ClientState, Convo, Presence, Space};
 use crate::design_system::{Avatar, Badge, StatusDot};
 use crate::icons::{Icon, IconName};
 use crate::window_chrome::DragStrip;
@@ -28,7 +28,25 @@ struct RowEvents {
     on_open_menu: EventHandler<RoomMenu>,
 }
 
-fn row(item: &Convo, is_dm: bool, active_id: &str, events: RowEvents) -> Element {
+/// Resolve a DM's status dot: the live presence map (freshest — written
+/// by the backend's presence poll) beats the snapshot `Convo.status`
+/// (only refreshed when the room-list sync loop happens to wake) beats
+/// Offline (unknown / mock without presence).
+fn resolve_status(item: &Convo, presence: &BTreeMap<String, Presence>) -> Presence {
+    item.mxid
+        .as_deref()
+        .and_then(|mxid| presence.get(mxid).copied())
+        .or(item.status)
+        .unwrap_or(Presence::Offline)
+}
+
+fn row(
+    item: &Convo,
+    is_dm: bool,
+    active_id: &str,
+    events: RowEvents,
+    presence: &BTreeMap<String, Presence>,
+) -> Element {
     let id = item.id.clone();
     let menu_id = item.id.clone();
     let is_active = active_id == item.id;
@@ -37,7 +55,11 @@ fn row(item: &Convo, is_dm: bool, active_id: &str, events: RowEvents) -> Element
     } else {
         "transparent"
     };
-    let status = item.status.unwrap_or(Presence::Offline);
+    let status = if is_dm {
+        resolve_status(item, presence)
+    } else {
+        Presence::Offline
+    };
     let RowEvents {
         on_select,
         on_open_menu,
@@ -73,11 +95,13 @@ fn row(item: &Convo, is_dm: bool, active_id: &str, events: RowEvents) -> Element
 /// One space's collapsible section: header (avatar/name/counts + nested
 /// hint) and the member rooms in the space's declared order. Children the
 /// account hasn't joined are simply absent — grouping is over joined rooms.
+#[allow(clippy::too_many_arguments)]
 fn space_section(
     space: &Space,
     rooms: &[Convo],
     active_id: &str,
     events: RowEvents,
+    presence: &BTreeMap<String, Presence>,
     collapsed: bool,
     on_toggle: EventHandler<String>,
     nested: bool,
@@ -118,7 +142,7 @@ fn space_section(
             }
             if !collapsed {
                 for r in grouped.iter() {
-                    {row(r, false, active_id, events)}
+                    {row(r, false, active_id, events, presence)}
                 }
             }
         }
@@ -132,6 +156,7 @@ fn drawer_body(
     spaces: &[Space],
     active_id: &str,
     events: RowEvents,
+    presence: &BTreeMap<String, Presence>,
     on_close: EventHandler<()>,
     on_open_discovery: EventHandler<()>,
     on_open_settings: EventHandler<()>,
@@ -177,7 +202,7 @@ fn drawer_body(
                 if !dms.is_empty() {
                     div { style: "font-size:11px;font-weight:700;letter-spacing:0.06em;color:var(--text-tertiary);padding:10px 8px 4px;", "DIRECT MESSAGES" }
                     for d in dms.iter() {
-                        {row(d, true, active_id, events)}
+                        {row(d, true, active_id, events, presence)}
                     }
                 }
                 for space in spaces.iter() {
@@ -186,6 +211,7 @@ fn drawer_body(
                         rooms,
                         active_id,
                         events,
+                        presence,
                         collapsed.read().get(&space.id).copied().unwrap_or(false),
                         {
                             let mut collapsed = collapsed;
@@ -203,7 +229,7 @@ fn drawer_body(
                 if !ungrouped.is_empty() {
                     div { style: "font-size:11px;font-weight:700;letter-spacing:0.06em;color:var(--text-tertiary);padding:14px 8px 4px;", "ROOMS" }
                     for r in ungrouped.iter() {
-                        {row(r, false, active_id, events)}
+                        {row(r, false, active_id, events, presence)}
                     }
                 }
             }
@@ -273,6 +299,13 @@ pub fn NavDrawer(
     let collapsed = use_signal(HashMap::<String, bool>::new);
     // The open right-click menu, if any.
     let mut menu = use_signal(|| None::<RoomMenu>);
+    // Live presence (checkpoint 06): the DM rows resolve their status dots
+    // against the backend's presence map — same precedence as the profile
+    // panel (live map → snapshot `status` → Offline). Reading the signal
+    // here subscribes the whole drawer, so dots update as presence lands
+    // instead of waiting for the next room-list sync wake.
+    let sync = use_context::<ClientState>();
+    let presence: BTreeMap<String, Presence> = (sync.presence)();
     let events = RowEvents {
         on_select,
         on_open_menu: EventHandler::new(move |(id, x, y): RoomMenu| menu.set(Some((id, x, y)))),
@@ -281,14 +314,14 @@ pub fn NavDrawer(
     if inline {
         rsx! {
             div { style: "width:280px;flex-shrink:0;height:100%;border-right:1px solid var(--border-subtle);",
-                {drawer_body(&dms, &rooms, &spaces, &active_id, events, on_close, on_open_discovery, on_open_settings, on_open_self, me_avatar.clone(), collapsed, menu, on_leave)}
+                {drawer_body(&dms, &rooms, &spaces, &active_id, events, &presence, on_close, on_open_discovery, on_open_settings, on_open_self, me_avatar.clone(), collapsed, menu, on_leave)}
             }
         }
     } else {
         rsx! {
             div { onclick: move |_| on_close.call(()), style: "position:absolute;inset:0;background:rgba(0,0,0,0.4);z-index:30;" }
             div { style: "position:absolute;left:0;top:0;bottom:0;z-index:31;box-shadow:var(--shadow-lg);",
-                {drawer_body(&dms, &rooms, &spaces, &active_id, events, on_close, on_open_discovery, on_open_settings, on_open_self, me_avatar.clone(), collapsed, menu, on_leave)}
+                {drawer_body(&dms, &rooms, &spaces, &active_id, events, &presence, on_close, on_open_discovery, on_open_settings, on_open_self, me_avatar.clone(), collapsed, menu, on_leave)}
             }
         }
     }

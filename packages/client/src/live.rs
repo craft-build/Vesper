@@ -4,14 +4,15 @@
 //! Three concerns, all running on the matrix runtime thread:
 //! - [`TypingManager`]: the outgoing typing debounce (4s idle reset, stop on
 //!   send), spawned off the command loop so it never blocks other commands.
-//! - [`start_live`]: a `PresenceEvent` handler maintaining the `presence`
-//!   map, plus (native only) a `SyncMessageLikeEvent` handler firing desktop
-//!   notifications for messages in background rooms.
+//! - [`start_live`]: a `PresenceEvent` handler plus a presence poll task
+//!   maintaining the `presence` map, plus (native only) a
+//!   `SyncMessageLikeEvent` handler firing desktop notifications for
+//!   messages in background rooms.
 //!
 //! The notification handler reads the UI-written `focused` / `active_room`
 //! signals to suppress notifications the user doesn't need.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,20 +21,27 @@ use matrix_sdk::event_handler::EventHandlerDropGuard;
 use matrix_sdk::ruma::events::presence::PresenceEvent;
 use matrix_sdk::ruma::presence::PresenceState;
 use matrix_sdk::{
-    ruma::{
-        self,
-        events::room::message::{MessageType, RoomMessageEventContent},
-        events::SyncMessageLikeEvent,
-        OwnedRoomId, RoomId,
-    },
     Client, Room,
+    ruma::{
+        self, OwnedRoomId, RoomId, UserId,
+        api::client::presence::get_presence,
+        events::SyncMessageLikeEvent,
+        events::room::message::{MessageType, RoomMessageEventContent},
+    },
 };
 
-use crate::{api::ClientState, model::Presence};
+use crate::{
+    api::ClientState,
+    model::{ConvoKind, Presence},
+};
 
 /// How long after the last input we keep telling the homeserver we're typing
 /// before sending a `typing = false` (docs/06 §Design decisions).
 const TYPING_IDLE_RESET: Duration = Duration::from_secs(4);
+
+/// How often the presence poll refreshes DM counterparts' presence over
+/// `GET /presence/{userId}/status` (see [`poll_dm_presence`]).
+const PRESENCE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Manages outgoing typing notices per room with a 4s idle reset.
 ///
@@ -162,12 +170,26 @@ fn parse_room_id(s: &str) -> Option<OwnedRoomId> {
     RoomId::parse(s).ok()
 }
 
-/// Handles for the live-state event handlers, so logout can unregister them.
-/// Held only for their `Drop` side effects (unregistering the handlers); the
-/// fields are never read directly.
+/// Aborts the wrapped task when dropped, so dropping [`LiveHandles`]
+/// (logout / re-login) stops the presence poll — a bare `JoinHandle`
+/// detaches instead.
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Handles for the live-state event handlers and the presence poll task,
+/// so logout can unregister/stop them. Held only for their `Drop` side
+/// effects; the fields are never read directly.
 #[allow(dead_code)]
 pub struct LiveHandles {
     presence: EventHandlerDropGuard,
+    presence_poll: AbortOnDrop,
     #[cfg(not(target_arch = "wasm32"))]
     notify: EventHandlerDropGuard,
 }
@@ -176,10 +198,12 @@ pub struct LiveHandles {
 /// Dropping the returned [`LiveHandles`] unregisters them.
 pub fn start_live(client: &Client, state: ClientState) -> LiveHandles {
     let presence = start_presence(client, state);
+    let presence_poll = spawn_presence_poll(client, state);
     #[cfg(not(target_arch = "wasm32"))]
     let notify = start_notifications(client, state);
     LiveHandles {
         presence,
+        presence_poll,
         #[cfg(not(target_arch = "wasm32"))]
         notify,
     }
@@ -187,12 +211,13 @@ pub fn start_live(client: &Client, state: ClientState) -> LiveHandles {
 
 /// Maintain `state.presence` from `m.presence` events.
 ///
-/// NOTE: under the simplified sliding sync (`SyncService`) matrix-sdk 0.18
-/// delivers no presence — `SyncResponse.presence` is always empty
-/// (`matrix-sdk-base/src/sliding_sync.rs`). The handler is registered anyway
-/// so a homeserver/SDK that does deliver presence lights up the dots; until
-/// then contacts resolve to `Offline` with a `debug` log (documented known
-/// limitation, docs/06 §Design decisions).
+/// NOTE: under the simplified sliding sync (`SyncService`, MSC4186) the
+/// sync response carries no presence at all — the protocol has no presence
+/// extension and `SyncResponse.presence` is synthesized empty — so this
+/// handler stays dormant on matrix-sdk 0.18. [`poll_dm_presence`] is what
+/// actually feeds the map; this handler remains registered (and de-dups
+/// against the poll via the changed-value check) for the day the SDK/server
+/// delivers presence over sync again.
 fn start_presence(client: &Client, state: ClientState) -> EventHandlerDropGuard {
     let handle = client.add_event_handler(move |ev: PresenceEvent| async move {
         let mxid = ev.sender.to_string();
@@ -216,6 +241,77 @@ fn map_presence_state(p: &PresenceState) -> Presence {
         // `PresenceState` is non-exhaustive; anything unknown reads as offline.
         _ => Presence::Offline,
     }
+}
+
+/// Spawn the presence poll loop ([`poll_dm_presence`] on a
+/// [`PRESENCE_POLL_INTERVAL`] cadence, first pass immediately so dots light
+/// up right after login). Until the room list lands there is nothing to
+/// poll, so the loop retries fast instead of waiting out a full interval;
+/// once a pass finds DM counterparts it settles to the regular cadence.
+/// Aborted when the returned guard drops.
+fn spawn_presence_poll(client: &Client, state: ClientState) -> AbortOnDrop {
+    const FAST_RETRY: Duration = Duration::from_secs(2);
+    let client = client.clone();
+    let task = tokio::spawn(async move {
+        let mut interval = FAST_RETRY;
+        loop {
+            if poll_dm_presence(&client, state).await {
+                interval = PRESENCE_POLL_INTERVAL;
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+    AbortOnDrop(Some(task.abort_handle()))
+}
+
+/// One presence pass: fetch each DM counterpart's presence with
+/// `GET /presence/{userId}/status` and upsert changed entries into
+/// `state.presence`. Returns whether any counterpart was polled (i.e. the
+/// room list had DM rows).
+///
+/// Why polling: MSC4186 simplified sliding sync has no presence extension,
+/// so `m.presence` events never arrive over sync and the
+/// [`start_presence`] handler never fires — without this, every DM status
+/// dot renders permanently Offline. The REST endpoint works against any
+/// homeserver, is not rate-limited per spec, and only serves users we share
+/// a room with — exactly the DM counterparts polled here. Per-user failures
+/// (e.g. server-side 403) log at `debug` and leave the last value standing.
+async fn poll_dm_presence(client: &Client, state: ClientState) -> bool {
+    let mxids: BTreeSet<String> = state
+        .convos
+        .peek()
+        .iter()
+        .filter(|c| c.kind == ConvoKind::Dm)
+        .filter_map(|c| c.mxid.clone())
+        .collect();
+    if mxids.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    let mut map: BTreeMap<String, Presence> = state.presence.peek().clone();
+    for mxid in &mxids {
+        let Ok(user) = UserId::parse(mxid.as_str()) else {
+            continue;
+        };
+        match client.send(get_presence::v3::Request::new(user)).await {
+            Ok(resp) => {
+                let mapped = map_presence_state(&resp.presence);
+                if map.get(mxid).copied() != Some(mapped) {
+                    map.insert(mxid.clone(), mapped);
+                    changed = true;
+                    tracing::debug!(%mxid, presence = ?mapped, "presence updated (poll)");
+                }
+            }
+            Err(e) => tracing::debug!(%mxid, "presence fetch failed: {e}"),
+        }
+    }
+    // One write per pass, and only if something actually changed, so the
+    // drawer doesn't rerender on every poll tick.
+    if changed {
+        let mut presence = state.presence;
+        presence.set(map);
+    }
+    true
 }
 
 /// Desktop notifications for incoming messages in background rooms

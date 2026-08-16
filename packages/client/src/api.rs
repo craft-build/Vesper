@@ -51,10 +51,11 @@ pub struct ClientState {
     /// by the typing task. Snap-shot-only backends (mock) never publish here.
     pub typing: Signal<BTreeMap<String, Vec<String>>, SyncStorage>,
     /// Per-user presence (checkpoint 06): the latest presence for each user
-    /// keyed by MXID, written by the backend's presence task from
-    /// `m.presence` events and read by the profile panel and the nav-drawer
-    /// status dots (via the `Convo.status` mapping done in the sync task).
-    /// Same one-map lifecycle as `messages`.
+    /// keyed by MXID, written by the backend's presence poll (`GET
+    /// /presence/{userId}/status` for DM counterparts — MSC4186 sync carries
+    /// no presence) and read directly by the profile panel and the nav
+    /// drawer's status dots (with the snapshot `Convo.status` mapping in the
+    /// sync task as a fallback). Same one-map lifecycle as `messages`.
     pub presence: Signal<BTreeMap<String, Presence>, SyncStorage>,
     /// Whether the app window is focused (checkpoint 06): UI-written (the
     /// shell's focus/visibility listener), backend-read by the desktop
@@ -429,7 +430,9 @@ pub trait VesperClient {
         _encrypted: Option<String>,
         _thumb: Option<(u32, u32)>,
     ) -> Result<String, ClientError> {
-        Err(ClientError::unsupported("Media is not supported by this backend."))
+        Err(ClientError::unsupported(
+            "Media is not supported by this backend.",
+        ))
     }
 
     /// Save `attachment`'s full-resolution content to `dest_path`
@@ -442,7 +445,9 @@ pub trait VesperClient {
         _attachment: Attachment,
         _dest_path: String,
     ) -> Result<(), ClientError> {
-        Err(ClientError::unsupported("Media is not supported by this backend."))
+        Err(ClientError::unsupported(
+            "Media is not supported by this backend.",
+        ))
     }
 
     // ------------------------------------------------------------------

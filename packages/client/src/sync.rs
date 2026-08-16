@@ -22,10 +22,10 @@ use std::sync::{Arc, RwLock};
 use dioxus_signals::{ReadableExt, Signal, SyncStorage, WritableExt};
 use eyeball_im::VectorDiff;
 use futures::StreamExt;
-use matrix_sdk::{ruma::events::space::child::SpaceChildEventContent, Client, RoomState};
+use matrix_sdk::{Client, RoomState, ruma::events::space::child::SpaceChildEventContent};
 use matrix_sdk_ui::{
     room_list_service::{
-        filters::new_filter_all, RoomListItem, RoomListLoadingState, RoomListService,
+        RoomListItem, RoomListLoadingState, RoomListService, filters::new_filter_all,
     },
     sync_service::{State as SyncState, SyncService},
 };
@@ -245,9 +245,8 @@ pub async fn start_room_list(
                     }
                     if let Some(mxid) = row.1.mxid.as_ref() {
                         if changed.contains(&mxid) {
-                            row.1 =
-                                map_item(&row.0, own_id.as_ref(), presence_signal, &membership)
-                                    .await;
+                            row.1 = map_item(&row.0, own_id.as_ref(), presence_signal, &membership)
+                                .await;
                             changed_any = true;
                         }
                     }
@@ -313,7 +312,10 @@ fn placeholder_convo(id: &str) -> Convo {
 async fn pair(
     item: RoomListItem,
     own_id: Option<&matrix_sdk::ruma::OwnedUserId>,
-    presence_signal: dioxus_signals::Signal<BTreeMap<String, Presence>, dioxus_signals::SyncStorage>,
+    presence_signal: dioxus_signals::Signal<
+        BTreeMap<String, Presence>,
+        dioxus_signals::SyncStorage,
+    >,
     membership: &HashMap<String, String>,
     space_cache: &mut HashMap<String, Space>,
 ) -> (RoomListItem, Convo) {
@@ -338,7 +340,10 @@ async fn pair(
 async fn attach(
     diffs: Vec<VectorDiff<RoomListItem>>,
     own_id: Option<&matrix_sdk::ruma::OwnedUserId>,
-    presence_signal: dioxus_signals::Signal<BTreeMap<String, Presence>, dioxus_signals::SyncStorage>,
+    presence_signal: dioxus_signals::Signal<
+        BTreeMap<String, Presence>,
+        dioxus_signals::SyncStorage,
+    >,
     membership: &HashMap<String, String>,
     space_cache: &mut HashMap<String, Space>,
 ) -> Vec<VectorDiff<(RoomListItem, Convo)>> {
@@ -353,7 +358,14 @@ async fn attach(
         membership: &HashMap<String, String>,
         space_cache: &mut HashMap<String, Space>,
     ) -> (RoomListItem, Convo) {
-        pair(item.clone(), own_id, presence_signal, membership, space_cache).await
+        pair(
+            item.clone(),
+            own_id,
+            presence_signal,
+            membership,
+            space_cache,
+        )
+        .await
     }
 
     let mut out = Vec::with_capacity(diffs.len());
@@ -362,7 +374,8 @@ async fn attach(
             VectorDiff::Append { values } => {
                 let mut mapped = Vec::with_capacity(values.len());
                 for v in values.iter() {
-                    mapped.push(pair_ref(v, own_id, presence_signal, membership, space_cache).await);
+                    mapped
+                        .push(pair_ref(v, own_id, presence_signal, membership, space_cache).await);
                 }
                 VectorDiff::Append {
                     values: mapped.into_iter().collect(),
@@ -390,7 +403,8 @@ async fn attach(
             VectorDiff::Reset { values } => {
                 let mut mapped = Vec::with_capacity(values.len());
                 for v in values.iter() {
-                    mapped.push(pair_ref(v, own_id, presence_signal, membership, space_cache).await);
+                    mapped
+                        .push(pair_ref(v, own_id, presence_signal, membership, space_cache).await);
                 }
                 VectorDiff::Reset {
                     values: mapped.into_iter().collect(),
@@ -468,8 +482,9 @@ fn space_membership(spaces: &[Space]) -> HashMap<String, String> {
 /// (they were pre-computed for the filters); `is_direct` is the only async
 /// store lookup, batched via `join_all` by the caller. For DMs (checkpoint 06)
 /// we additionally resolve the *other* member's MXID and look up their
-/// presence in `presence_signal` — the nav drawer's status dot and the
-/// profile panel read these.
+/// presence in `presence_signal` — a snapshot fallback: the profile panel
+/// and the nav drawer's status dots prefer the live presence map and only
+/// fall back to this when a user has no entry yet.
 async fn map_item(
     item: &RoomListItem,
     own_id: Option<&matrix_sdk::ruma::OwnedUserId>,
@@ -674,9 +689,7 @@ mod tests {
                     index: 1,
                     value: mk(9),
                 },
-                VectorDiff::PushFront {
-                    value: mk(0),
-                },
+                VectorDiff::PushFront { value: mk(0) },
                 VectorDiff::Remove { index: 2 },
             ],
         );
