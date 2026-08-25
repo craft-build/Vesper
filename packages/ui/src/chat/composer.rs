@@ -4,9 +4,13 @@ use crate::data::{Attachment, AttachmentKind, Message};
 use crate::design_system::{Button, ButtonSize, IconButton};
 use crate::icons::{Icon, IconName};
 
+/// Same quick-set as the message reaction picker (message_row.rs); local
+/// copy since the composer inserts into the draft rather than reacting.
+const EMOJI_CHOICES: [&str; 6] = ["👍", "❤️", "😂", "🎉", "✅", "👀"];
+
 /// Extensions that map to inline-renderable image messages; anything else
 /// sends as `m.file` (mime itself is sniffed from the bytes at send time).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn kind_of(path: &str) -> AttachmentKind {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     if matches!(
@@ -19,7 +23,7 @@ fn kind_of(path: &str) -> AttachmentKind {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn format_size(bytes: u64) -> String {
     if bytes >= 1_000_000 {
         format!("{:.1} MB", bytes as f64 / 1_000_000.0)
@@ -32,8 +36,9 @@ fn format_size(bytes: u64) -> String {
 
 /// Native file pick (checkpoint 07). The dialog must run on the UI thread;
 /// the picked path travels into the model's `local_path` — the backend
-/// reads the bytes at send time. wasm has no rfd yet (web: checkpoint 11).
-#[cfg(not(target_arch = "wasm32"))]
+/// reads the bytes at send time. Desktop only: rfd has no Android backend
+/// and wasm has no rfd yet (web: checkpoint 11).
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub fn pick_attachment() -> Option<Attachment> {
     let file = rfd::FileDialog::new().pick_file()?;
     let path = file.display().to_string();
@@ -49,7 +54,7 @@ pub fn pick_attachment() -> Option<Attachment> {
     Some(attachment)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub fn pick_attachment() -> Option<Attachment> {
     None
 }
@@ -69,6 +74,7 @@ pub fn Composer(
 ) -> Element {
     let mut val = use_signal(String::new);
     let mut attachment = use_signal(|| Option::<Attachment>::None);
+    let mut show_emoji = use_signal(|| false);
 
     let mut send = move || {
         let text = val().trim().to_string();
@@ -129,8 +135,29 @@ pub fn Composer(
                     },
                     Icon { name: IconName::Paperclip, size: 17 }
                 }
-                div { style: "display:flex;gap:2px;",
-                    IconButton { label: "Emoji", Icon { name: IconName::Smile, size: 15 } }
+                div {
+                    onmouseleave: move |_| show_emoji.set(false),
+                    style: "display:flex;gap:2px;position:relative;",
+                    IconButton {
+                        label: "Emoji",
+                        onclick: move |_| show_emoji.set(!show_emoji()),
+                        Icon { name: IconName::Smile, size: 15 }
+                    }
+                    if show_emoji() {
+                        div { style: "position:absolute;bottom:36px;left:0;display:flex;gap:4px;background:var(--bg-surface-raised);border:1px solid var(--border-subtle);border-radius:var(--radius-md);box-shadow:var(--shadow-md);padding:6px;z-index:4;",
+                            for e in EMOJI_CHOICES.iter() {
+                                button {
+                                    key: "{e}",
+                                    onclick: move |_| {
+                                        val.write().push_str(e);
+                                        show_emoji.set(false);
+                                    },
+                                    style: "background:none;border:none;cursor:pointer;font-size:16px;padding:2px;",
+                                    "{e}"
+                                }
+                            }
+                        }
+                    }
                 }
                 textarea {
                     value: "{val}",

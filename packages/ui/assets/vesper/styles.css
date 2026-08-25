@@ -1,4 +1,19 @@
-@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+/* Self-hosted fonts: Manrope and JetBrains Mono (variable, latin subset),
+   both licensed under the SIL Open Font License 1.1 (OFL). */
+@font-face {
+  font-family: 'Manrope';
+  font-style: normal;
+  font-weight: 400 800;
+  font-display: swap;
+  src: url("fonts/manrope-var.woff2") format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("fonts/jetbrains-mono-var.woff2") format('woff2');
+}
 
 :root{
 --white:#ffffff;

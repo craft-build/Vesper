@@ -23,6 +23,11 @@ client = { workspace = true, default-features = false }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Native-only: enables the `matrix` feature (matrix-sdk + runtime bridge).
 client = { workspace = true, features = ["matrix"] }
+
 # Checkpoint 07: native pick/save dialogs for attachments. Synchronous on
 # the UI thread (the dialogs must not run on the backend's tokio thread).
+# Desktop OSes only: rfd 0.15 has no Android backend (it fails to compile
+# there), and wasm is excluded until web checkpoint 11. Android falls back
+# to the no-op picker/save paths gated the same way in the source.
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 rfd = "0.15"

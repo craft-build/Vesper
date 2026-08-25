@@ -20,7 +20,7 @@ pub fn Dialog(
                 }
             },
             div {
-                style: "width:400px;background:var(--bg-surface-raised);border-radius:var(--radius-lg);border:1px solid var(--border-default);box-shadow:var(--shadow-lg);padding:24px;font-family:var(--font-sans);",
+                style: "width:min(400px,calc(100vw - 32px));background:var(--bg-surface-raised);border-radius:var(--radius-lg);border:1px solid var(--border-default);box-shadow:var(--shadow-lg);padding:24px;font-family:var(--font-sans);",
                 onclick: move |evt| evt.stop_propagation(),
                 div { style: "font-size:18px;font-weight:700;color:var(--text-primary);margin-bottom:12px;", "{title}" }
                 div { style: "font-size:14px;color:var(--text-secondary);line-height:1.5;", {children} }

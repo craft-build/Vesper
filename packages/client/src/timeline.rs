@@ -51,15 +51,18 @@ pub const PAGE: u16 = 30;
 
 /// Shared snapshot of one room's timeline: raw items plus the most recently
 /// published mapped messages. The mapped length doubles as the cheap "did
-/// pagination add anything" probe for [`TimelineRegistry::load_older`].
+/// pagination add anything" probe for [`load_older_page`].
 #[derive(Default)]
-struct EntryState {
+pub(crate) struct EntryState {
     items: Vec<Arc<TimelineItem>>,
     mapped_len: usize,
 }
 
 struct Entry {
-    timeline: Timeline,
+    /// `Arc` so the initial backfill and spawned `LoadOlder` pagination
+    /// tasks can share the handle — their network I/O runs off the
+    /// sequential command loop (checkpoint-06 lesson).
+    timeline: Arc<Timeline>,
     /// Room handle for operations that don't go through the timeline (e.g.
     /// attachment uploads, checkpoint 07 — `Timeline` is not `Clone`, so a
     /// spawned upload task needs its own `Room` clone).
@@ -166,42 +169,13 @@ impl TimelineRegistry {
         };
 
         let own_id = client.user_id().map(|u| u.to_string()).unwrap_or_default();
-        // Backfill BEFORE publishing: `subscribe` starts with whatever the
-        // event cache already holds, which can be a single message. That
-        // renders one short row with no scrollbar, and since back-pagination
-        // is triggered by scrolling, a room like that could never load its
-        // history. Paginate until there's at least one page of mapped
-        // messages (enough to overflow the viewport → scrollable → user
-        // pagination works) or the timeline start is reached. Batched here,
-        // pre-publish, so the first paint is the filled history, not a flash
-        // of an almost-empty room.
-        let (initial, _stream) = timeline.subscribe().await;
-        let mut items: Vec<Arc<TimelineItem>> = initial.iter().cloned().collect();
-        for _ in 0..10 {
-            let mapped = items
-                .iter()
-                .filter(|i| map_item(i, &own_id).is_some())
-                .count();
-            if mapped >= PAGE as usize {
-                break;
-            }
-            match timeline.paginate_backwards(PAGE).await {
-                Ok(true) => break, // reached the start of the timeline
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(room_id, "initial backfill failed: {e}");
-                    break;
-                }
-            }
-            // Refresh the snapshot after each page.
-            let (fresh, _s) = timeline.subscribe().await;
-            items = fresh.iter().cloned().collect();
-        }
-        // Final subscription: its stream starts cleanly at the backfilled
-        // state (the first stream was never polled and can lag).
-        let (final_items, stream) = timeline.subscribe().await;
+        let timeline = Arc::new(timeline);
+        // One subscription: the diff task below polls this stream
+        // immediately, so it can't lag the way an unpolled stream would
+        // (the reason the old inline path subscribed twice).
+        let (initial, stream) = timeline.subscribe().await;
         let inner: Arc<Mutex<EntryState>> = Arc::new(Mutex::new(EntryState {
-            items: final_items.iter().cloned().collect(),
+            items: initial.iter().cloned().collect(),
             mapped_len: 0,
         }));
         let send_handles: Arc<Mutex<Vec<SendHandle>>> = Default::default();
@@ -237,7 +211,7 @@ impl TimelineRegistry {
         self.entries.insert(
             room_id.to_string(),
             Entry {
-                timeline,
+                timeline: timeline.clone(),
                 room,
                 inner,
                 task,
@@ -249,6 +223,45 @@ impl TimelineRegistry {
             },
         );
         tracing::info!(room_id, "timeline opened");
+
+        // Initial backfill, off the sequential command loop (checkpoint-06
+        // lesson): `subscribe` starts with whatever the event cache holds,
+        // which can be a single message — too few rows to scroll, and
+        // pagination is scroll-triggered, so a room like that would never
+        // load its history. Paginate until at least one page of mapped
+        // messages exists or the timeline start is reached. The diff task
+        // publishes every page's vector diffs as they land (mapped the same
+        // way the old inline path batched them), so updates flow exactly as
+        // before — only who does the waiting changes.
+        let inner = self.entries[room_id].inner.clone();
+        let room_id = room_id.to_string();
+        tokio::spawn(async move {
+            let mut last_len = lock(&inner).mapped_len;
+            for _ in 0..10 {
+                if last_len >= PAGE as usize {
+                    break;
+                }
+                match timeline.paginate_backwards(PAGE).await {
+                    Ok(true) => break, // reached the start of the timeline
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(room_id, "initial backfill failed: {e}");
+                        break;
+                    }
+                }
+                // The page is applied locally, but the diff task's publish
+                // is async; wait briefly so the "enough rows to scroll"
+                // check is honest (same probe as `load_older_page`).
+                for _ in 0..20 {
+                    let now = lock(&inner).mapped_len;
+                    if now != last_len {
+                        last_len = now;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }
+        });
     }
 
     /// Open (refcounted) a live, thread-focused timeline for the thread
@@ -351,10 +364,10 @@ impl TimelineRegistry {
         }
         if let Some(entry) = self.threads.remove(root_id) {
             entry.task.abort();
-            let mut map = entry.state.threads.peek().clone();
-            map.remove(root_id);
+            // Mutate in place: a clone-and-replace here would clobber any
+            // concurrent publisher's entry (lost-update race).
             let mut threads = entry.state.threads;
-            threads.set(map);
+            threads.write().remove(root_id);
             tracing::info!(root_id, "thread closed");
         }
     }
@@ -374,10 +387,9 @@ impl TimelineRegistry {
                 // Clear the published typing row so a reopened room doesn't
                 // show a stale "typing…" from the previous session.
                 if let Some(state) = &self.state {
-                    let mut map = state.typing.peek().clone();
-                    if map.remove(room_id).is_some() {
-                        let mut typing = state.typing;
-                        typing.set(map);
+                    let mut typing = state.typing;
+                    if typing.peek().contains_key(room_id) {
+                        typing.write().remove(room_id);
                     }
                 }
                 tracing::info!(room_id, "timeline closed");
@@ -385,29 +397,17 @@ impl TimelineRegistry {
         }
     }
 
-    /// Back-paginate one page; returns how many mapped messages were added
-    /// (0 on timeline-start or when pagination is unsupported).
-    pub async fn load_older(&self, room_id: &str) -> Result<usize, ClientError> {
-        let Some(entry) = self.entries.get(room_id) else {
-            return Ok(0);
-        };
-        let before = lock(&entry.inner).mapped_len;
-        entry
-            .timeline
-            .paginate_backwards(PAGE)
-            .await
-            .map_err(|e| ClientError::server(format!("Back-pagination failed: {e}")))?;
-        // The pagination request is done, but subscriber delivery is async;
-        // wait briefly for the diff to land so the returned count is honest
-        // and the UI spinner can stop at the right time.
-        for _ in 0..40 {
-            let now = lock(&entry.inner).mapped_len;
-            if now != before {
-                return Ok(now.saturating_sub(before));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        Ok(0)
+    /// Clone the handles a `LoadOlder` page fetch needs so the network
+    /// call (and its delivery wait) runs in a spawned task, off the
+    /// sequential command loop (checkpoint-06 lesson). `None` = timeline
+    /// not open, which `LoadOlder` answers as "0 messages added".
+    pub(crate) fn pagination_handles(
+        &self,
+        room_id: &str,
+    ) -> Option<(Arc<Timeline>, Arc<Mutex<EntryState>>)> {
+        self.entries
+            .get(room_id)
+            .map(|entry| (entry.timeline.clone(), entry.inner.clone()))
     }
 
     /// Abort every timeline task (logout / session teardown).
@@ -600,49 +600,22 @@ impl TimelineRegistry {
         Ok(Vec::new())
     }
 
-    /// One-shot read of the thread rooted at `root_id` (checkpoint 05,
-    /// thread panel): builds a thread-focused timeline against the same
-    /// room — cached thread events plus `/relations` back-pagination —
-    /// maps message rows to `ThreadReply`s, then drops it. Does not touch
-    /// the room's live timeline entry.
-    pub async fn thread_replies(
+    /// Clone the room + parse the root id for a `FetchThread` one-shot read
+    /// so the thread build + `/relations` backfill runs in a spawned task,
+    /// off the sequential command loop (checkpoint-06 lesson; mirrors how
+    /// the directory commands answer via oneshot).
+    pub fn thread_request(
         &self,
         room_id: &str,
         root_id: &str,
-    ) -> Result<Vec<ThreadReply>, ClientError> {
+    ) -> Result<(matrix_sdk::Room, OwnedEventId), ClientError> {
         let Some(entry) = self.entries.get(room_id) else {
             return Err(ClientError::invalid("That conversation is not open."));
         };
         let root = EventId::parse(root_id)
             .map(|e| e.to_owned())
             .map_err(|_| ClientError::network("Could not open that thread."))?;
-        let timeline = TimelineBuilder::new(entry.timeline.room())
-            .with_focus(TimelineFocus::Thread {
-                root_event_id: root,
-            })
-            .build()
-            .await
-            .map_err(|e| {
-                tracing::warn!(room_id, "thread timeline build failed: {e}");
-                ClientError::network("Could not open that thread.")
-            })?;
-        // Backfill up to two pages of thread replies from the server so
-        // pre-existing threads are actually populated, not just live ones.
-        for _ in 0..2 {
-            match timeline.paginate_backwards(PAGE).await {
-                Ok(true) => break, // beginning of the thread
-                Ok(false) => continue,
-                Err(e) => {
-                    tracing::warn!(room_id, "thread pagination failed: {e}");
-                    break;
-                }
-            }
-        }
-        let (items, _stream) = timeline.subscribe().await;
-        Ok(items
-            .iter()
-            .filter_map(|item| thread_reply_row(item))
-            .collect())
+        Ok((entry.timeline.room().clone(), root))
     }
 
     /// Retry a wedged local echo. Correlates the row (mapped `txn-` id) to
@@ -653,7 +626,9 @@ impl TimelineRegistry {
             return Err(ClientError::invalid("That conversation is not open."));
         };
         let Some(txn) = txn_of(mapped_id) else {
-            return Err(ClientError::invalid("Only pending messages can be retried."));
+            return Err(ClientError::invalid(
+                "Only pending messages can be retried.",
+            ));
         };
         let created_at = {
             let guard = lock(&entry.inner);
@@ -720,6 +695,71 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Back-paginate one page; returns how many mapped messages were added
+/// (0 on timeline-start or when pagination is unsupported). Runs in a
+/// spawned task (pagination is network I/O, the command loop is
+/// sequential); the runtime answers `LoadOlder`'s oneshot from it.
+pub(crate) async fn load_older_page(
+    timeline: &Timeline,
+    inner: &Mutex<EntryState>,
+) -> Result<usize, ClientError> {
+    let before = lock(inner).mapped_len;
+    timeline
+        .paginate_backwards(PAGE)
+        .await
+        .map_err(|e| ClientError::server(format!("Back-pagination failed: {e}")))?;
+    // The pagination request is done, but subscriber delivery is async;
+    // wait briefly for the diff to land so the returned count is honest
+    // and the UI spinner can stop at the right time.
+    for _ in 0..40 {
+        let now = lock(inner).mapped_len;
+        if now != before {
+            return Ok(now.saturating_sub(before));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    Ok(0)
+}
+
+/// One-shot read of the thread rooted at `root` (checkpoint 05, thread
+/// panel): builds a thread-focused timeline against the room — cached
+/// thread events plus `/relations` back-pagination — maps message rows to
+/// `ThreadReply`s, then drops it. Does not touch the room's live timeline
+/// entry. Runs in a spawned task (network I/O off the command loop).
+pub(crate) async fn thread_replies(
+    room: &matrix_sdk::Room,
+    root: OwnedEventId,
+) -> Result<Vec<ThreadReply>, ClientError> {
+    let room_id = room.room_id().to_string();
+    let timeline = TimelineBuilder::new(room)
+        .with_focus(TimelineFocus::Thread {
+            root_event_id: root,
+        })
+        .build()
+        .await
+        .map_err(|e| {
+            tracing::warn!(room_id, "thread timeline build failed: {e}");
+            ClientError::network("Could not open that thread.")
+        })?;
+    // Backfill up to two pages of thread replies from the server so
+    // pre-existing threads are actually populated, not just live ones.
+    for _ in 0..2 {
+        match timeline.paginate_backwards(PAGE).await {
+            Ok(true) => break, // beginning of the thread
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::warn!(room_id, "thread pagination failed: {e}");
+                break;
+            }
+        }
+    }
+    let (items, _stream) = timeline.subscribe().await;
+    Ok(items
+        .iter()
+        .filter_map(|item| thread_reply_row(item))
+        .collect())
+}
+
 /// Spawn the incoming-typing task for one room (checkpoint 06). Owns the
 /// `subscribe_to_typing_notifications` drop guard: when this task is aborted
 /// (on close/logout) the guard drops and the ephemeral handler unregisters.
@@ -743,10 +783,9 @@ fn spawn_typing_task(
                 Ok(Err(_)) => break, // channel closed (client dropped)
                 Err(_) => {
                     // Prune timeout: clear the row if anyone was shown typing.
-                    let mut map = state.typing.peek().clone();
-                    if map.remove(&room_id).is_some() {
-                        let mut typing = state.typing;
-                        typing.set(map);
+                    let mut typing = state.typing;
+                    if typing.peek().contains_key(&room_id) {
+                        typing.write().remove(&room_id);
                     }
                 }
             }
@@ -772,16 +811,18 @@ async fn publish_typing(
             .unwrap_or_else(|| id.as_str().to_string());
         names.push(name);
     }
-    let mut map = state.typing.peek().clone();
-    let changed = map.get(room_id).cloned() != Some(names.clone());
+    // Compare-then-mutate in place through the signal — clone-and-replace
+    // here raced other publishers (diff tasks in other rooms, the typing
+    // prune) and silently reverted their rows until the next update.
+    let mut typing = state.typing;
+    let changed = typing.peek().get(room_id).cloned() != Some(names.clone());
     if changed {
+        let mut map = typing.write();
         if names.is_empty() {
             map.remove(room_id);
         } else {
             map.insert(room_id.to_string(), names);
         }
-        let mut typing = state.typing;
-        typing.set(map);
     }
 }
 
@@ -879,10 +920,11 @@ fn publish(
             .collect();
         lock(send_handles).retain(|h| pending.contains(&h.created_at));
     }
-    let mut map = state.messages.peek().clone();
-    map.insert(room_id.to_string(), mapped);
+    // Insert through the write guard, not a clone-and-replace: publishers
+    // in different rooms run on independent tasks and a stale map clone
+    // would clobber their rows.
     let mut messages = state.messages;
-    messages.set(map);
+    messages.write().insert(room_id.to_string(), mapped);
 }
 
 /// Re-map a thread-focused timeline and publish it into
@@ -896,10 +938,10 @@ fn publish_thread(state: &ClientState, root_id: &str, items: &Mutex<Vec<Arc<Time
             .filter_map(|item| thread_reply_row(item))
             .collect()
     };
-    let mut map = state.threads.peek().clone();
-    map.insert(root_id.to_string(), replies);
+    // Same in-place discipline as `publish`: never clone-and-replace the
+    // map from an independent task.
     let mut threads = state.threads;
-    threads.set(map);
+    threads.write().insert(root_id.to_string(), replies);
 }
 
 /// Map one timeline item to a UI message. `None` = nothing to render

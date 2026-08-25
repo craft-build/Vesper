@@ -253,8 +253,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("vesper.log.2026-08-14"), b"a").expect("write");
         std::fs::write(dir.path().join("vesper.log.2026-08-15"), b"bb").expect("write");
-        let (path, size) =
-            newest_log_file(dir.path()).expect("dir").expect("some file");
+        let (path, size) = newest_log_file(dir.path())
+            .expect("dir")
+            .expect("some file");
         assert!(path.to_string_lossy().ends_with("2026-08-15"));
         assert_eq!(size, 2);
     }

@@ -77,14 +77,20 @@ async fn fetch(
     let bytes = fetch_uncached(client, source, thumb, err_prefix, mxc).await?;
 
     // Store + evict on the tokio runtime; eviction walks the cache dir.
+    // An unwritable cache dir degrades to "this fetch stays uncached"
+    // (same promise as the read/setup path) — never fail the fetch itself.
     if let Ok(dir) = crate::media_cache::cache_dir() {
-        crate::media_cache::write(&dir, &key, &bytes)?;
-        let cap = crate::media_cache::DEFAULT_CAP_BYTES;
-        tokio::task::spawn_blocking(move || {
-            crate::media_cache::evict_to_cap(&dir, cap);
-        })
-        .await
-        .ok();
+        match crate::media_cache::write(&dir, &key, &bytes) {
+            Ok(()) => {
+                let cap = crate::media_cache::DEFAULT_CAP_BYTES;
+                tokio::task::spawn_blocking(move || {
+                    crate::media_cache::evict_to_cap(&dir, cap);
+                })
+                .await
+                .ok();
+            }
+            Err(e) => tracing::warn!(mxc, "media cache write failed, leaving uncached: {e}"),
+        }
     }
     Ok(bytes)
 }

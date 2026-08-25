@@ -21,13 +21,14 @@ use matrix_sdk::event_handler::EventHandlerDropGuard;
 use matrix_sdk::ruma::events::presence::PresenceEvent;
 use matrix_sdk::ruma::presence::PresenceState;
 use matrix_sdk::{
-    Client, Room,
     ruma::{
-        self, OwnedRoomId, RoomId, UserId,
+        self,
         api::client::presence::get_presence,
-        events::SyncMessageLikeEvent,
         events::room::message::{MessageType, RoomMessageEventContent},
+        events::SyncMessageLikeEvent,
+        OwnedRoomId, RoomId, UserId,
     },
+    Client, Room,
 };
 
 use crate::{

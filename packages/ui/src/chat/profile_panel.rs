@@ -46,10 +46,13 @@ impl From<Convo> for ProfileTarget {
 impl ProfileTarget {
     pub fn person(name: impl Into<String>, mxid: impl Into<String>) -> Self {
         Self {
+            // `id: None` = identity not yet resolved against the backend
+            // (contract review): presence stays unknown too — the panel must
+            // not fabricate an Online dot for an unresolved mention.
             id: None,
             name: name.into(),
             mxid: Some(mxid.into()),
-            status: Some(Presence::Online),
+            status: None,
             is_room: false,
             topic: None,
             members: None,
@@ -62,7 +65,7 @@ impl ProfileTarget {
     /// checkpoint 07): carries the account avatar MXC when known.
     pub fn own(me: &Me) -> Self {
         Self {
-            id: None,
+            id: Some(me.id.clone()),
             name: me.name.clone(),
             mxid: Some(me.id.clone()),
             status: Some(Presence::Online),
@@ -79,13 +82,18 @@ impl ProfileTarget {
 pub fn ProfilePanel(
     target: ProfileTarget,
     on_close: EventHandler<()>,
-    on_start_call: EventHandler<bool>,
     on_message: EventHandler<ProfileTarget>,
 ) -> Element {
     let client = use_context::<Rc<dyn VesperClient>>();
     let sync = use_context::<ClientState>();
     let mut verify_open = use_signal(|| false);
     let mut verified = use_signal(|| false);
+
+    // Unknown-identity gate (contract review): `id: None` means the target
+    // was synthesized (e.g. an unresolved mention) and was NEVER resolved
+    // against the backend. Verify/Message would key off the possibly-
+    // fabricated MXID, so they only render for a known identity.
+    let identity_known = target.id.is_some();
 
     let mxid = target.mxid.clone().unwrap_or_default();
     // Clone for the effect closure; `mxid` itself stays owned by the
@@ -130,14 +138,14 @@ pub fn ProfilePanel(
             div { style: "flex:1;overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:18px;align-items:center;text-align:center;",
                 span { style: "position:relative;",
                     Avatar { name: "{target.name}", size: 72, mxc: target.avatar.clone() }
-                    if !target.is_room {
+                    if !target.is_room && identity_known {
                         span { style: "position:absolute;right:-2px;bottom:-2px;", StatusDot { status: presence, size: 14 } }
                     }
                 }
                 div {
                     div { style: "font-size:18px;font-weight:700;", if target.is_room { "#{target.name}" } else { "{target.name}" } }
                     div { style: "font-size:13px;color:var(--text-tertiary);font-family:var(--font-mono);margin-top:2px;",
-                        if target.is_room { "{target.topic.clone().unwrap_or_default()}" } else { "{mxid}" }
+                        if target.is_room { "{target.topic.clone().unwrap_or_default()}" } else if identity_known { "{mxid}" } else { "unknown id" }
                     }
                 }
                 if target.encrypted {
@@ -148,16 +156,12 @@ pub fn ProfilePanel(
                         Icon { name: IconName::Users, size: 14 }
                         "{target.members.unwrap_or(0)} members"
                     }
-                } else {
+                } else if identity_known {
                     div { style: "width:100%;display:flex;flex-direction:column;gap:8px;",
                         div { style: "display:flex;gap:8px;justify-content:center;",
                             Button { variant: ButtonVariant::Secondary, size: crate::design_system::ButtonSize::Sm, onclick: { let t = target.clone(); move |_| on_message.call(t.clone()) },
                                 Icon { name: IconName::MessageSquare, size: 14 }
                                 " Message"
-                            }
-                            Button { variant: ButtonVariant::Secondary, size: crate::design_system::ButtonSize::Sm, onclick: move |_| on_start_call.call(true),
-                                Icon { name: IconName::Video, size: 14 }
-                                " Call"
                             }
                         }
                         div { style: "margin-top:10px;text-align:left;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:14px;display:flex;align-items:center;gap:10px;",
@@ -186,6 +190,10 @@ pub fn ProfilePanel(
                             }
                         }
                     }
+                } else {
+                    // id: None — target was synthesized without a backend
+                    // identity; don't offer actions keyed off a fabricated MXID.
+                    div { style: "font-size:12px;color:var(--text-tertiary);", "Identity not resolved yet — actions unavailable." }
                 }
             }
             VerifyDialog {

@@ -21,7 +21,6 @@ pub fn FocusHeader(
     convo: Convo,
     on_open_nav: EventHandler<()>,
     on_open_switcher: EventHandler<()>,
-    on_start_call: EventHandler<bool>,
     on_open_room_info: EventHandler<()>,
 ) -> Element {
     rsx! {
@@ -46,8 +45,6 @@ pub fn FocusHeader(
                 Tag { tone: TagTone::Brand, "e2ee" }
             }
             DragStrip {}
-            {icon_button("Voice call", move |_| on_start_call.call(false), IconName::Phone)}
-            {icon_button("Video call", move |_| on_start_call.call(true), IconName::Video)}
             {icon_button("Room info", move |_| on_open_room_info.call(()), IconName::Info)}
             WindowControls {}
         }

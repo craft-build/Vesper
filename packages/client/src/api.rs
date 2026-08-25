@@ -268,13 +268,15 @@ pub trait VesperClient {
     ) -> Message;
     /// Send a text reply in the thread rooted at `message_id` within
     /// `convo_id` (the room id is required to build the `m.thread` relation
-    /// with the real backend).
+    /// with the real backend). The returned `ThreadReply` is a bookkeeping
+    /// stub — the painted row comes from the thread timeline's diff stream;
+    /// the `Err` carries a hard send failure so the UI can toast it.
     async fn send_thread_reply(
         &self,
         convo_id: &str,
         message_id: &str,
         text: String,
-    ) -> ThreadReply;
+    ) -> Result<ThreadReply, ClientError>;
     /// Add the user's `emoji` reaction to `message_id`, or retract it when
     /// already present (toggle semantics). The returned aggregate may lag
     /// the toggle by one echo round-trip on the real backend; live rows

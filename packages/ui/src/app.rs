@@ -141,6 +141,11 @@ pub fn App() -> Element {
 
     rsx! {
         document::Link { rel: "stylesheet", href: STYLES }
+        // styles.css rounds html/body for the borderless transparent macOS
+        // window; a mobile webview has no such window, so un-round there.
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            document::Style { "html,body{{border-radius:0}}" }
+        }
         if restoring {
             Splash {}
         } else if me().is_some() {
@@ -319,6 +324,9 @@ fn SettingsPage() -> Element {
     track_screen(Screen::Settings);
     rsx! {
         SettingsScreen {
+            // Mobile: pill tabs across the top instead of the 200px sidebar,
+            // which pushes the 480px content column off a phone's width.
+            is_mobile: cfg!(any(target_os = "android", target_os = "ios")),
             on_close: move |_| {
                 // Back out to wherever settings was opened from — the room
                 // the user was reading, or Home — instead of always landing

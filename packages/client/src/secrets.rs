@@ -22,6 +22,10 @@
 //! Tests force the file backend via `VESPER_SECRET_STORE=file` so they never
 //! touch a real keychain.
 
+// The keyring dep is only compiled for its two backend platforms (see
+// Cargo.toml target sections). Everywhere else — Android, Linux — the
+// module compiles to the file fallback described above.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use keyring::Entry;
 
 use crate::api::ClientError;
@@ -56,6 +60,7 @@ impl Secret {
 
 /// Loud-but-once fallback warning: every secret op on a broken keyring
 /// would otherwise repeat the same paragraph per call.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn warn_fallback(reason: &str) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
@@ -72,18 +77,22 @@ fn warn_fallback(reason: &str) {
 
 /// True unless `VESPER_SECRET_STORE=file` forces the file backend (tests,
 /// deliberate opt-out). Keyring availability itself is probed per-op.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn keyring_enabled() -> bool {
     std::env::var_os("VESPER_SECRET_STORE").as_deref() != Some(std::ffi::OsStr::new("file"))
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn keyring_entry(secret: Secret) -> Option<Entry> {
     if !keyring_enabled() {
         warn_fallback("VESPER_SECRET_STORE=file");
         return None;
     }
-    Entry::new(SERVICE, secret.account()).inspect_err(|e| {
-        warn_fallback(&format!("keyring entry unavailable: {e}"));
-    }).ok()
+    Entry::new(SERVICE, secret.account())
+        .inspect_err(|e| {
+            warn_fallback(&format!("keyring entry unavailable: {e}"));
+        })
+        .ok()
 }
 
 /// Persist `value` for `secret` (keyring when available, else `0600` file
@@ -95,8 +104,9 @@ pub(crate) fn save(
     value: &str,
     legacy_path: &std::path::Path,
 ) -> Result<(), ClientError> {
-    match keyring_entry(secret) {
-        Some(entry) => match entry.set_password(value) {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if let Some(entry) = keyring_entry(secret) {
+        return match entry.set_password(value) {
             Ok(()) => {
                 // Migration tail: the file copy (if any) is now redundant.
                 let _ = std::fs::remove_file(legacy_path);
@@ -106,23 +116,18 @@ pub(crate) fn save(
                 warn_fallback(&format!("keyring write failed: {e}"));
                 save_file(value, legacy_path)
             }
-        },
-        None => save_file(value, legacy_path),
+        };
     }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = secret;
+    save_file(value, legacy_path)
 }
 
 fn save_file(value: &str, legacy_path: &std::path::Path) -> Result<(), ClientError> {
-    std::fs::write(legacy_path, value)
-        .map_err(|e| ClientError::storage(format!("Could not store credentials: {e}")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            legacy_path,
-            std::fs::Permissions::from_mode(0o600),
-        );
-    }
-    Ok(())
+    // Owner-only from file creation, even under a permissive umask — a
+    // plain `fs::write` + chmod would leave a world-readable window.
+    crate::session::write_owner_only(legacy_path, value.as_bytes())
+        .map_err(|e| ClientError::storage(format!("Could not store credentials: {e}")))
 }
 
 /// Load `secret`: keyring first; a legacy file is migrated (stored into the
@@ -132,24 +137,25 @@ pub(crate) fn load(
     secret: Secret,
     legacy_path: &std::path::Path,
 ) -> Result<Option<String>, ClientError> {
-    match keyring_entry(secret) {
-        Some(entry) => match entry.get_password() {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if let Some(entry) = keyring_entry(secret) {
+        match entry.get_password() {
             Ok(value) => {
                 // Migration tail (read side): a file from ≤checkpoint-10 is
                 // redundant the moment the keyring answers.
                 if legacy_path.exists() {
                     let _ = std::fs::remove_file(legacy_path);
                 }
-                Ok(Some(value))
+                return Ok(Some(value));
             }
-            Err(keyring::Error::NoEntry) => load_legacy(secret, legacy_path),
+            Err(keyring::Error::NoEntry) => return load_legacy(secret, legacy_path),
             Err(e) => {
                 warn_fallback(&format!("keyring read failed: {e}"));
-                load_legacy(secret, legacy_path)
+                return load_legacy(secret, legacy_path);
             }
-        },
-        None => load_legacy(secret, legacy_path),
+        }
     }
+    load_legacy(secret, legacy_path)
 }
 
 /// Read the legacy file; when the keyring is usable, hoist the value into
@@ -161,13 +167,13 @@ fn load_legacy(
     let Ok(bytes) = std::fs::read(legacy_path) else {
         return Ok(None);
     };
-    let value = String::from_utf8(bytes).map_err(|e| {
-        ClientError::storage(format!("Stored credentials are not readable: {e}"))
-    })?;
+    let value = String::from_utf8(bytes)
+        .map_err(|e| ClientError::storage(format!("Stored credentials are not readable: {e}")))?;
     let value = value.trim().to_string();
     // Hoist into the keyring when possible; if that fails the file stays
     // authoritative (still readable next launch) and the fallback warning
     // has already fired inside `save`.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     if keyring_enabled() {
         if let Some(entry) = keyring_entry(secret) {
             if entry.set_password(&value).is_ok() {
@@ -185,22 +191,32 @@ fn load_legacy(
 /// Remove `secret` from wherever it lives (keyring entry + legacy file).
 /// Logout is the caller; missing entries are success.
 pub(crate) fn delete(secret: Secret, legacy_path: &std::path::Path) {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Some(entry) = keyring_entry(secret) {
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {}
             Err(e) => tracing::warn!("could not delete keyring entry: {e}"),
         }
     }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = secret;
     let _ = std::fs::remove_file(legacy_path);
 }
 
 /// Report which backend actually served the last op — surfaced in
 /// diagnostics so users can see when they're on the file fallback.
 pub(crate) fn backend_in_use() -> &'static str {
-    if keyring_enabled() {
-        "os-keyring (file fallback if unavailable)"
-    } else {
-        "file (VESPER_SECRET_STORE=file)"
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        if keyring_enabled() {
+            "os-keyring (file fallback if unavailable)"
+        } else {
+            "file (VESPER_SECRET_STORE=file)"
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        "file (no OS keyring backend on this platform)"
     }
 }
 
@@ -232,10 +248,7 @@ mod tests {
                 Some("hunter2".into())
             );
             delete(Secret::StorePassphrase, &path);
-            assert_eq!(
-                load(Secret::StorePassphrase, &path).expect("load"),
-                None
-            );
+            assert_eq!(load(Secret::StorePassphrase, &path).expect("load"), None);
         });
     }
 

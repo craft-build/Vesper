@@ -26,6 +26,8 @@ matrix = [
     "dep:getrandom",
     "dep:keyring",
     "dep:filetime",
+    "dep:jni",
+    "dep:ndk-context",
 ]
 
 [dependencies]
@@ -76,6 +78,14 @@ tempfile = "3"
 # no backend here: headless/keyring-less installs take the loud file
 # fallback in `secrets.rs` (a zbus secret-service backend is the documented
 # follow-up).
+# Android session restore: `directories` can't resolve a data dir on
+# Android, so `session::data_dir` queries the app's private files dir over
+# JNI (ndk_context is process-global, initialized by dioxus at activity
+# creation). Versions shadow the ones dioxus/tao bring in.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", optional = true }
+ndk-context = { version = "0.1", optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # v1 = the app-facing Entry API; it transitively enables the apple backend
 # store with its required `keychain` sub-feature (that store dep is itself

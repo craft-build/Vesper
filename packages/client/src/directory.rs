@@ -156,7 +156,9 @@ pub async fn leave_room(client: &Client, room_id: &str) -> Result<(), ClientErro
     let room_id = matrix_sdk::ruma::RoomId::parse(room_id)
         .map_err(|_| ClientError::invalid(format!("“{room_id}” is not a room id.")))?;
     let Some(room) = client.get_room(&room_id) else {
-        return Err(ClientError::invalid("That room isn't in your list anymore."));
+        return Err(ClientError::invalid(
+            "That room isn't in your list anymore.",
+        ));
     };
     room.leave()
         .await
@@ -194,9 +196,7 @@ fn join_error(err: &matrix_sdk::Error) -> ClientError {
                 "Rate limited — you're joining rooms too fast.{hint}"
             ))
         }
-        Some(ErrorKind::Forbidden) => {
-            ClientError::auth("You can't join that room (invite-only?).")
-        }
+        Some(ErrorKind::Forbidden) => ClientError::auth("You can't join that room (invite-only?)."),
         _ => ClientError::server(format!("Could not join: {err}")),
     }
 }

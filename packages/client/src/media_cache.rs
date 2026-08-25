@@ -41,7 +41,11 @@ pub(crate) fn cache_key(mxc: &str, encrypted: Option<&str>, thumb: Option<(u32, 
         (None, Some((w, h))) => format!("{mxc}\u{1}\u{1}{w}x{h}"),
         (None, None) => format!("{mxc}\u{1}\u{1}"),
     };
-    format!("{:016x}{:016x}", fnv1a(&identity, 0xcbf2_9ce4_8422_2325), fnv1a(&identity, 0x9e37_79b9_7f4a_7c15))
+    format!(
+        "{:016x}{:016x}",
+        fnv1a(&identity, 0xcbf2_9ce4_8422_2325),
+        fnv1a(&identity, 0x9e37_79b9_7f4a_7c15)
+    )
 }
 
 /// FNV-1a with an arbitrary seed.
@@ -135,7 +139,15 @@ pub(crate) fn evict_to_cap(dir: &Path, cap: u64) {
             break;
         }
         if std::fs::remove_file(&path).is_ok() {
-            tracing::debug!(?path, mtime_secs = mtime.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0), size, "evicted media cache entry");
+            tracing::debug!(
+                ?path,
+                mtime_secs = mtime
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                size,
+                "evicted media cache entry"
+            );
             excess = excess.saturating_sub(size);
         }
     }
@@ -158,7 +170,9 @@ fn collect(dir: &Path) -> Result<Vec<(std::time::SystemTime, PathBuf, u64)>, Cli
 }
 
 fn dir_size(dir: &Path) -> u64 {
-    collect(dir).map(|entries| entries.iter().map(|(_, _, size)| size).sum()).unwrap_or(0)
+    collect(dir)
+        .map(|entries| entries.iter().map(|(_, _, size)| size).sum())
+        .unwrap_or(0)
 }
 
 /// Portable mtime touch. Uses `filetime` when available; std-only fallback
@@ -203,7 +217,10 @@ mod tests {
     fn write_read_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(dir.path(), "k1", b"pixels").expect("write");
-        assert_eq!(read(dir.path(), "k1").as_deref(), Some(b"pixels".as_slice()));
+        assert_eq!(
+            read(dir.path(), "k1").as_deref(),
+            Some(b"pixels".as_slice())
+        );
         assert_eq!(read(dir.path(), "missing"), None);
     }
 
@@ -233,7 +250,10 @@ mod tests {
         std::env::remove_var("VESPER_SECRET_STORE");
         std::env::remove_var("VESPER_DATA_DIR");
         assert_eq!(freed, 128, "freed");
-        assert!(collect(&cache).expect("collect").is_empty(), "cache emptied");
+        assert!(
+            collect(&cache).expect("collect").is_empty(),
+            "cache emptied"
+        );
     }
 
     fn size_of_dir(dir: &std::path::Path) -> u64 {

@@ -66,6 +66,28 @@ pub fn SettingsScreen(
     on_close: EventHandler<()>,
     #[props(default = false)] is_mobile: bool,
 ) -> Element {
+    #[allow(unused_mut)]
+    let mut is_mobile = is_mobile;
+    // `cfg!` in app.rs only covers mobile binary targets; a web build opened
+    // on a phone reports falsely. Probe the user agent at runtime (eval is a
+    // no-op capable API on all webview targets); UA plumbing avoids
+    // misclassifying small desktop windows.
+    if !is_mobile {
+        let mut probed = use_signal(|| false);
+        use_effect(move || {
+            spawn(async move {
+                let js = "return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) \
+                     || navigator.userAgentData?.mobile === true;";
+                if let Ok(true) = document::eval(js).recv::<bool>().await {
+                    probed.set(true);
+                }
+            });
+        });
+        if probed() {
+            is_mobile = true;
+        }
+    }
+
     let client = use_context::<Rc<dyn VesperClient>>();
     let mut tab = use_signal(|| SettingsTab::General);
     let mut verify_id = use_signal(|| Option::<String>::None);
@@ -148,10 +170,14 @@ pub fn SettingsScreen(
                     js_string_literal(&payload)
                 );
                 match document::eval(&js).recv::<bool>().await {
-                    Ok(true) => use_context::<crate::design_system::ToastCenter>()
-                        .success("Diagnostics copied", Some("Paste it into your issue report.".into())),
-                    _ => use_context::<crate::design_system::ToastCenter>()
-                        .info("Could not copy", Some("Your clipboard denied access.".into())),
+                    Ok(true) => use_context::<crate::design_system::ToastCenter>().success(
+                        "Diagnostics copied",
+                        Some("Paste it into your issue report.".into()),
+                    ),
+                    _ => use_context::<crate::design_system::ToastCenter>().info(
+                        "Could not copy",
+                        Some("Your clipboard denied access.".into()),
+                    ),
                 }
             }
         });
@@ -268,13 +294,14 @@ pub fn SettingsScreen(
     // Avatar upload: the file dialog runs inside a spawned task (never in
     // the event callback — macOS nested-pump crash, see docs/07 notes).
     // Failures surface as toasts (checkpoint 11): there is no inline field
-    // next to the avatar button to hold them.
+    // next to the avatar button to hold them. rfd is desktop-only (no
+    // Android backend; wasm is web checkpoint 11) — no-op elsewhere.
     let change_avatar = {
         let client = client.clone();
         move |_| {
             let client = client.clone();
             spawn(async move {
-                #[cfg(not(target_arch = "wasm32"))]
+                #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
                 {
                     let Some(path) = rfd::FileDialog::new()
                         .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"])
@@ -290,6 +317,8 @@ pub fn SettingsScreen(
                         Err(e) => use_context::<crate::design_system::ToastCenter>().error(&e),
                     }
                 }
+                #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+                let _ = client; // no dialog backend on this platform
             });
         }
     };
@@ -323,23 +352,13 @@ pub fn SettingsScreen(
                 div { style: "flex:1;padding:28px;overflow-y:auto;",
                     div { style: "display:flex;flex-direction:column;gap:20px;max-width:480px;",
                         if is_mobile {
-                            div { style: "display:flex;gap:8px;",
-                                for t in TABS.iter() {
-                                    {
-                                        let is_active = tab() == *t;
-                                        let bg = if is_active { "var(--bg-selected)" } else { "var(--bg-surface-raised)" };
-                                        let color = if is_active { "var(--text-brand)" } else { "var(--text-secondary)" };
-                                        let tv = *t;
-                                        rsx! {
-                                            button {
-                                                key: "{t.value()}",
-                                                onclick: move |_| tab.set(tv),
-                                                style: "background:{bg};color:{color};border:none;border-radius:var(--radius-md);padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer;",
-                                                "{t.label()}"
-                                            }
-                                        }
-                                    }
-                                }
+                            // Class-based tabs, not dynamic inline styles:
+                            // dioxus 0.7 style re-patching mangles var()
+                            // shorthands on re-render (white boxes).
+                            crate::design_system::Tabs {
+                                active: tab().value().to_string(),
+                                on_change: move |v: String| tab.set(SettingsTab::from_value(&v)),
+                                tabs: TABS.iter().map(|t| crate::design_system::TabItem { value: t.value().to_string(), label: t.label().to_string() }).collect::<Vec<_>>(),
                             }
                         }
                         if tab() == SettingsTab::General {
@@ -689,7 +708,10 @@ pub fn SettingsScreen(
 /// Human label for the media cache size row.
 fn cache_size_label(bytes: Option<u64>) -> String {
     match bytes {
-        Some(bytes) => format!("{} on disk (auto-limited to 500 MB)", client_bytes_label(bytes)),
+        Some(bytes) => format!(
+            "{} on disk (auto-limited to 500 MB)",
+            client_bytes_label(bytes)
+        ),
         None => "Unknown".into(),
     }
 }

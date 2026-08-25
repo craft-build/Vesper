@@ -22,10 +22,10 @@ use std::sync::{Arc, RwLock};
 use dioxus_signals::{ReadableExt, Signal, SyncStorage, WritableExt};
 use eyeball_im::VectorDiff;
 use futures::StreamExt;
-use matrix_sdk::{Client, RoomState, ruma::events::space::child::SpaceChildEventContent};
+use matrix_sdk::{ruma::events::space::child::SpaceChildEventContent, Client, RoomState};
 use matrix_sdk_ui::{
     room_list_service::{
-        RoomListItem, RoomListLoadingState, RoomListService, filters::new_filter_all,
+        filters::new_filter_all, RoomListItem, RoomListLoadingState, RoomListService,
     },
     sync_service::{State as SyncState, SyncService},
 };

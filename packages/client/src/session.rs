@@ -22,7 +22,7 @@
 //! classified by [`friendly_error`] and reduced to fixed sentences (raw errors
 //! can carry server responses we don't control).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use matrix_sdk::{
     authentication::matrix::MatrixSession, ruma::api::error::ErrorKind, Client, ClientBuildError,
@@ -41,9 +41,54 @@ pub(crate) fn data_dir() -> Result<PathBuf, ClientError> {
     if let Some(dir) = std::env::var_os("VESPER_DATA_DIR") {
         return Ok(PathBuf::from(dir));
     }
+    #[cfg(target_os = "android")]
+    {
+        return android_data_dir();
+    }
+    #[cfg(not(target_os = "android"))]
     directories::ProjectDirs::from("dev", "vesper", "vesper")
         .map(|dirs| dirs.data_dir().to_path_buf())
         .ok_or_else(|| ClientError::storage("Could not determine this platform's data directory"))
+}
+
+/// Android has no desktop-style data dir (`directories` returns `None`), and
+/// the app's private files dir is only reachable through JNI. The context
+/// pointers are process-global and initialized by dioxus (manganis) at
+/// activity creation, so by the time session restore runs they are valid.
+/// Same mechanism `dioxus-asset-resolver` uses to reach the AssetManager.
+#[cfg(target_os = "android")]
+fn android_data_dir() -> Result<PathBuf, ClientError> {
+    use jni::{objects::JObject, JavaVM};
+
+    let ctx = ndk_context::android_context();
+    if ctx.vm().is_null() || ctx.context().is_null() {
+        return Err(ClientError::storage(
+            "android JNI context not initialized (restore raced app startup)",
+        ));
+    }
+    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }
+        .map_err(|e| ClientError::storage(format!("android JVM unavailable: {e}")))?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|e| ClientError::storage(format!("android JNI attach failed: {e}")))?;
+    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+    fn storage_err(what: &str) -> impl FnOnce(jni::errors::Error) -> ClientError + '_ {
+        move |e| ClientError::storage(format!("{what}: {e}"))
+    }
+    let files_dir = env
+        .call_method(context, "getFilesDir", "()Ljava/io/File;", &[])
+        .and_then(|v| v.l())
+        .map_err(storage_err("Context.getFilesDir failed"))?;
+    let path = env
+        .call_method(files_dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
+        .and_then(|v| v.l())
+        .map_err(storage_err("File.getAbsolutePath failed"))?;
+    let path: String = env
+        .get_string(&path.into())
+        .map_err(storage_err("JNI string conversion failed"))?
+        .into();
+    Ok(PathBuf::from(path))
 }
 
 fn store_dir() -> Result<PathBuf, ClientError> {
@@ -159,9 +204,7 @@ fn friendly_http_error(http_err: &HttpError) -> ClientError {
         Some(ErrorKind::InvalidParam) | Some(ErrorKind::InvalidUsername) => {
             ClientError::invalid("The server didn't recognize that username.")
         }
-        Some(ErrorKind::UserDeactivated) => {
-            ClientError::auth("This account has been deactivated.")
-        }
+        Some(ErrorKind::UserDeactivated) => ClientError::auth("This account has been deactivated."),
         Some(ErrorKind::UserLocked) | Some(ErrorKind::UserSuspended) => {
             ClientError::auth("This account is suspended.")
         }
@@ -230,7 +273,7 @@ fn save_session(session: &MatrixSession) -> Result<(), ClientError> {
 /// Write `bytes` to `path` readable only by the owner from the moment the
 /// file exists (no create-then-chmod window, even under `umask 000`).
 #[cfg(unix)]
-fn write_owner_only(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -247,7 +290,7 @@ fn write_owner_only(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
 /// On non-unix platforms the filesystem's ACLs govern access; nothing more
 /// we can do portably here (keyring storage is checkpoint-11 work).
 #[cfg(not(unix))]
-fn write_owner_only(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 

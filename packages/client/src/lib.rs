@@ -218,30 +218,30 @@ mod matrix_impl {
             stub.send_state = send_state;
             stub
         }
+        // Checkpoint 05: like `send_message`, the painted row comes from
+        // the live thread timeline's diff stream — the returned value is a
+        // placeholder. A hard send failure propagates so the UI can toast
+        // it (soft/queued failures paint on the echo instead).
         async fn send_thread_reply(
             &self,
             convo_id: &str,
             message_id: &str,
             text: String,
-        ) -> ThreadReply {
+        ) -> Result<ThreadReply, ClientError> {
             let body = text.clone();
-            if let Err(e) = self
-                .ask(move |reply| Command::SendThreadReply {
-                    room_id: convo_id.to_string(),
-                    root_id: message_id.to_string(),
-                    text: body,
-                    reply,
-                })
-                .await
-            {
-                tracing::warn!("send_thread_reply: {}", e);
-            }
-            ThreadReply {
+            self.ask(move |reply| Command::SendThreadReply {
+                room_id: convo_id.to_string(),
+                root_id: message_id.to_string(),
+                text: body,
+                reply,
+            })
+            .await?;
+            Ok(ThreadReply {
                 from: String::new(),
                 time: String::new(),
                 mine: true,
                 text,
-            }
+            })
         }
         async fn react(&self, convo_id: &str, message_id: &str, emoji: &str) -> Vec<Reaction> {
             self.ask(move |reply| Command::ToggleReaction {

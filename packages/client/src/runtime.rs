@@ -270,9 +270,7 @@ pub enum Command {
     },
     /// Bytes used by the on-disk media cache (checkpoint 11 §C). Local
     /// files, cheap: answered from a spawned task (the dir walk).
-    MediaCacheBytes {
-        reply: oneshot::Sender<u64>,
-    },
+    MediaCacheBytes { reply: oneshot::Sender<u64> },
     /// Delete every cached media entry; replies with the bytes freed
     /// (checkpoint 11 §C settings action).
     ClearMediaCache {
@@ -508,11 +506,17 @@ async fn notification_toggles(
     let settings = client.notification_settings().await;
     let mut out = Vec::with_capacity(crate::notifications::RULE_TABLE.len());
     for def in crate::notifications::RULE_TABLE {
+        // ALL-rule semantics: any disabled rule disables the toggle; no
+        // later rule may resurrect it (the first `false`/error wins).
         let mut enabled = def.default;
         for rule in def.rules {
             let kind = map_rule_kind(rule.kind);
             match settings.is_push_rule_enabled(kind, rule.rule_id).await {
-                Ok(v) => enabled = v,
+                Ok(true) => enabled = true,
+                Ok(false) => {
+                    enabled = false;
+                    break;
+                }
                 Err(_) => {
                     enabled = def.default;
                     break;
@@ -590,8 +594,13 @@ impl ClientRuntime {
                     let mut timelines = TimelineRegistry::default();
                     // Checkpoint 08: the active interactive verification
                     // session, if any. One at a time; replaced by a new
-                    // `StartVerification` and aborted on logout.
-                    let mut verification: Option<crate::verification::Session> = None;
+                    // `StartVerification` and aborted on logout. Shared
+                    // slot: StartVerification resolves the target in a
+                    // spawned task (network key query) and stores the
+                    // session from there.
+                    let verification = Arc::new(std::sync::Mutex::new(
+                        Option::<crate::verification::Session>::None,
+                    ));
 
                     while let Some(cmd) = rx.recv().await {
                         match cmd {
@@ -691,7 +700,11 @@ impl ClientRuntime {
                                 // with the account; cancel it server-side and
                                 // blank the slot so a later login's dialog
                                 // never resumes stale state.
-                                if let Some(session) = verification.take() {
+                                if let Some(session) = verification
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .take()
+                                {
                                     session.abort();
                                 }
                                 if let Some(bound) = &bound {
@@ -744,7 +757,22 @@ impl ClientRuntime {
                                 timelines.close(&room_id);
                             }
                             Command::LoadOlder { room_id, reply } => {
-                                let _ = reply.send(timelines.load_older(&room_id).await);
+                                // Answered from a spawned task: pagination + its
+                                // delivery wait are network I/O, the command
+                                // loop is sequential (checkpoint-06 lesson).
+                                match timelines.pagination_handles(&room_id) {
+                                    Some((timeline, inner)) => {
+                                        tokio::spawn(async move {
+                                            let result =
+                                                crate::timeline::load_older_page(&timeline, &inner)
+                                                    .await;
+                                            let _ = reply.send(result);
+                                        });
+                                    }
+                                    None => {
+                                        let _ = reply.send(Ok(0));
+                                    }
+                                }
                             }
                             Command::SendMessage {
                                 room_id,
@@ -779,7 +807,7 @@ impl ClientRuntime {
                                         }
                                         None => {
                                             let _ = reply.send(Err(ClientError::invalid(
-                                                "That conversation is not open."
+                                                "That conversation is not open.",
                                             )));
                                         }
                                     }
@@ -866,8 +894,21 @@ impl ClientRuntime {
                                 root_id,
                                 reply,
                             } => {
-                                let _ =
-                                    reply.send(timelines.thread_replies(&room_id, &root_id).await);
+                                // Answered from a spawned task: the thread
+                                // build + /relations backfill are network I/O
+                                // (mirrors the directory commands).
+                                match timelines.thread_request(&room_id, &root_id) {
+                                    Err(e) => {
+                                        let _ = reply.send(Err(e));
+                                    }
+                                    Ok((room, root)) => {
+                                        tokio::spawn(async move {
+                                            let result =
+                                                crate::timeline::thread_replies(&room, root).await;
+                                            let _ = reply.send(result);
+                                        });
+                                    }
+                                }
                             }
                             Command::OpenThread { room_id, root_id } => {
                                 if let Some(bound) = &bound {
@@ -906,7 +947,11 @@ impl ClientRuntime {
                                     continue;
                                 };
                                 // Replace any running session: one dialog.
-                                if let Some(old) = verification.take() {
+                                if let Some(old) = verification
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .take()
+                                {
                                     old.abort();
                                 }
                                 let subject = match &target {
@@ -917,21 +962,32 @@ impl ClientRuntime {
                                     }
                                     crate::model::VerificationTarget::User(_) => String::new(),
                                 };
-                                // One awaited key query, then the driver task
-                                // owns everything else; the request clone for
-                                // cancel-on-replacement is taken inside.
-                                verification = Some(
-                                    crate::verification::Session::start(
-                                        client,
-                                        target,
-                                        subject,
-                                        bound.state,
+                                // The one target-resolution key query is a
+                                // network round-trip: it runs in a spawned
+                                // task so the command loop keeps moving
+                                // (checkpoint-06 lesson). `Session::start`
+                                // publishes `Requested` before its await, so
+                                // the dialog has feedback immediately; the
+                                // driver task then owns everything else.
+                                let client = client.clone();
+                                let state = bound.state;
+                                let slot = verification.clone();
+                                tokio::spawn(async move {
+                                    let session = crate::verification::Session::start(
+                                        &client, target, subject, state,
                                     )
-                                    .await,
-                                );
+                                    .await;
+                                    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                                    if let Some(old) = guard.replace(session) {
+                                        // A newer StartVerification raced us
+                                        // to the slot; cancel the loser.
+                                        old.abort();
+                                    }
+                                });
                             }
                             Command::VerificationAction { action } => {
-                                if let Some(session) = verification.as_ref() {
+                                let guard = verification.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(session) = guard.as_ref() {
                                     session.act(action);
                                 }
                             }

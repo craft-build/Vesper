@@ -690,7 +690,7 @@ impl VesperClient for MockClient {
         _convo_id: &str,
         message_id: &str,
         text: String,
-    ) -> ThreadReply {
+    ) -> Result<ThreadReply, ClientError> {
         let mut state = self.state.borrow_mut();
         let from = state.me.name.clone();
         let reply = ThreadReply {
@@ -710,7 +710,7 @@ impl VesperClient for MockClient {
                 break;
             }
         }
-        reply
+        Ok(reply)
     }
 
     async fn react(&self, convo_id: &str, message_id: &str, emoji: &str) -> Vec<Reaction> {
@@ -996,7 +996,9 @@ impl VesperClient for MockClient {
         let had_room = state.convos.iter().any(|c| c.id == room_id);
         let had_space = state.spaces.iter().any(|s| s.id == room_id);
         if !had_room && !had_space {
-            return Err(ClientError::invalid("That room isn't in your list anymore."));
+            return Err(ClientError::invalid(
+                "That room isn't in your list anymore.",
+            ));
         }
         state.convos.retain(|c| c.id != room_id);
         state.spaces.retain(|s| s.id != room_id);

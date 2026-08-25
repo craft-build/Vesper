@@ -13,7 +13,6 @@ pub fn Conversation(
     convo: Convo,
     is_mobile: bool,
     #[props(default = None)] on_back: Option<EventHandler<()>>,
-    on_start_call: EventHandler<bool>,
     on_open_thread: EventHandler<String>,
     on_open_profile: EventHandler<String>,
     on_open_room_info: EventHandler<()>,
@@ -253,8 +252,9 @@ pub fn Conversation(
     };
 
     // Attachment download (checkpoint 07): the save dialog must live on the
-    // UI thread, the fetch+write goes to the backend. wasm has no rfd — the
-    // button silently no-ops there for now (web is checkpoint 11).
+    // UI thread, the fetch+write goes to the backend. rfd is desktop-only
+    // (no Android backend, wasm comes with web checkpoint 11) — the button
+    // silently no-ops there for now.
     let download_attachment = {
         let client = client.clone();
         let convo_id = convo_id.clone();
@@ -269,14 +269,14 @@ pub fn Conversation(
             // borrowed" → destructor panic, verified crash). Deferring past
             // the handler via spawn breaks the overlap.
             spawn(async move {
-                #[cfg(not(target_arch = "wasm32"))]
+                #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
                 let dest = rfd::FileDialog::new()
                     .set_file_name(&suggested)
                     .save_file()
                     .map(|p| p.display().to_string());
-                #[cfg(target_arch = "wasm32")]
+                #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
                 let dest = None::<String>;
-                let _ = suggested; // suppress unused on wasm
+                let _ = suggested; // suppress unused where no dialog runs
                 let Some(dest) = dest else { return };
                 if let Err(e) = client.save_attachment(&convo_id, attachment, dest).await {
                     use_context::<crate::design_system::ToastCenter>().error(&e);
@@ -337,14 +337,33 @@ pub fn Conversation(
     });
 
     // Live map entry wins when the backend has opened this room's timeline;
-    // otherwise the snapshot path (mock / first paint).
-    #[allow(clippy::redundant_closure)] // Signal isn't FnOnce; closure is load-bearing
-    let msgs = sync
-        .messages
-        .read()
-        .get(&convo_id)
-        .cloned()
-        .unwrap_or_else(|| messages());
+    // otherwise the snapshot path (mock / first paint). The memo also SCOPES
+    // the subscription: `sync.messages` is one map signal for ALL rooms, so a
+    // bare body read would re-render this conversation on a publish to any
+    // other room. The memo re-runs on every map write but only notifies its
+    // dependents when THIS room's entry actually changed (Vec: PartialEq).
+    let msgs = use_memo({
+        let convo_id = convo_id.clone();
+        move || {
+            sync.messages
+                .read()
+                .get(&convo_id)
+                .cloned()
+                .unwrap_or_else(|| messages.read().clone())
+        }
+    });
+    // Reply-quote index shared by every row: ONE Rc'd map build per publish
+    // instead of an ≤800-element Vec clone per row per render. Rows receive
+    // an Rc clone (refcount bump); `Rc::ptr_eq` short-circuits the prop
+    // PartialEq for rows while the underlying map is unchanged.
+    let reply_index = use_memo(move || {
+        Rc::new(
+            msgs.read()
+                .iter()
+                .map(|m| (m.id.clone(), m.clone()))
+                .collect::<std::collections::BTreeMap<String, crate::data::Message>>(),
+        )
+    });
 
     // Rendered-rows cap (checkpoint 11 §C virtualization sanity check):
     // timelines open at one ~30-event page and grow only through explicit
@@ -354,8 +373,9 @@ pub fn Conversation(
     // the machine. True viewport virtualization stays future work (noted
     // in docs/11).
     const RENDER_CAP: usize = 800;
-    let hidden = msgs.len().saturating_sub(RENDER_CAP);
-    let visible = &msgs[hidden.min(msgs.len())..];
+    let msgs_ref = msgs.read();
+    let hidden = msgs_ref.len().saturating_sub(RENDER_CAP);
+    let visible = &msgs_ref[hidden.min(msgs_ref.len())..];
 
     // Content-driven scroll behavior. The reactive reads all happen INSIDE
     // this callback — that's what makes the effect re-run on each publish
@@ -475,27 +495,10 @@ pub fn Conversation(
                             Tag { tone: TagTone::Brand, "e2ee" }
                         }
                         button {
-                            title: "Voice call",
-                            onclick: move |_| on_start_call.call(false),
-                            style: "width:36px;height:36px;border-radius:var(--radius-md);border:none;background:transparent;color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;justify-content:center;",
-                            Icon { name: IconName::Phone, size: 16 }
-                        }
-                        button {
-                            title: "Video call",
-                            onclick: move |_| on_start_call.call(true),
-                            style: "width:36px;height:36px;border-radius:var(--radius-md);border:none;background:transparent;color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;justify-content:center;",
-                            Icon { name: IconName::Video, size: 16 }
-                        }
-                        button {
                             title: "Room info",
                             onclick: move |_| on_open_room_info.call(()),
                             style: "width:36px;height:36px;border-radius:var(--radius-md);border:none;background:transparent;color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;justify-content:center;",
                             Icon { name: IconName::Info, size: 16 }
-                        }
-                        button {
-                            title: "Search",
-                            style: "width:36px;height:36px;border-radius:var(--radius-md);border:none;background:transparent;color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;justify-content:center;",
-                            Icon { name: IconName::Search, size: 16 }
                         }
                     }
                 }
@@ -520,7 +523,7 @@ pub fn Conversation(
                     MessageRow {
                         key: "{m.id}",
                         m: m.clone(),
-                        all_messages: msgs.clone(),
+                        all_messages: reply_index(),
                         on_react: react.clone(),
                         on_reply: move |m| replying_to.set(Some(m)),
                         on_retry_send: retry_send.clone(),

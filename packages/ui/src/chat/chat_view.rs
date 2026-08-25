@@ -8,7 +8,7 @@ use super::nav_drawer::NavDrawer;
 use super::profile_panel::ProfilePanel;
 use super::switcher::Switcher;
 use super::thread_panel::ThreadPanel;
-use super::{CallScreen, CallState, ChatUiState, ProfileTarget, SidePanel};
+use super::{ChatUiState, ProfileTarget, SidePanel};
 use crate::app::Route;
 use crate::data::{ClientState, ConvoKind, Me, VesperClient};
 use crate::icons::Icon;
@@ -113,9 +113,22 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                 .find(|d| d.name == name)
                 .cloned()
                 .map(ProfileTarget::from)
-                .unwrap_or_else(|| {
-                    let mxid = format!("@{}:matrix.org", name.to_lowercase().replace(' ', ""));
-                    ProfileTarget::person(name.clone(), mxid)
+                // Identity honesty: a sender display name that matches no DM
+                // is UNKNOWN — never synthesize an MXID (a fabricated
+                // `@name:matrix.org` is attacker-registrable, and Verify
+                // would run against it). `id: None` / `mxid: None` /
+                // `status: None` let the panel gate identity-sensitive
+                // actions (Message / Verify).
+                .unwrap_or_else(|| ProfileTarget {
+                    id: None,
+                    name: name.clone(),
+                    mxid: None,
+                    status: None,
+                    is_room: false,
+                    topic: None,
+                    members: None,
+                    encrypted: false,
+                    avatar: None,
                 });
             ui.side_panel.set(Some(SidePanel::Profile { target }));
         }
@@ -127,19 +140,6 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
             if let Some(c) = convo.clone() {
                 ui.side_panel.set(Some(SidePanel::Profile {
                     target: ProfileTarget::from(c),
-                }));
-            }
-        }
-    };
-
-    let start_call = {
-        let convo = convo.clone();
-        move |video: bool| {
-            if let Some(c) = &convo {
-                ui.call.set(Some(CallState {
-                    name: c.name.clone(),
-                    video,
-                    is_dm: c.kind == ConvoKind::Dm,
                 }));
             }
         }
@@ -267,30 +267,48 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                     on_open_settings: move |_| { ui.nav_open.set(false); navigator.push(Route::SettingsPage {}); },
                     on_open_self: {
                         let me = me.clone();
-                        move |_| { ui.nav_open.set(false); ui.side_panel.set(Some(SidePanel::Profile { target: me.as_ref().map(ProfileTarget::own).unwrap_or_else(|| ProfileTarget::person("You", "@you:vesper.chat")) })); }
+                        move |_| { ui.nav_open.set(false); ui.side_panel.set(Some(SidePanel::Profile { target: me.as_ref().map(ProfileTarget::own).unwrap_or_else(|| ProfileTarget {
+                            // Signed-in account hasn't loaded yet — no
+                            // fabricated MXID, no assumed presence.
+                            id: None,
+                            name: "You".into(),
+                            mxid: None,
+                            status: None,
+                            is_room: false,
+                            topic: None,
+                            members: None,
+                            encrypted: false,
+                            avatar: None,
+                        }) })); }
                     },
                     on_leave: leave_room.clone(),
                     me_avatar: me_avatar.clone(),
                     inline: true,
                 }
             }
-            div { key: "{active_id}", style: "flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;",
+            div { style: "flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;",
                 if let Some(c) = &convo {
-                    FocusHeader {
-                        convo: c.clone(),
-                        on_open_nav: move |_| ui.nav_open.set(!(ui.nav_open)()),
-                        on_open_switcher: move |_| ui.switcher_open.set(true),
-                        on_start_call: start_call.clone(),
-                        on_open_room_info: open_room_info.clone(),
-                    }
-                    Conversation {
-                        convo: c.clone(),
-                        is_mobile: false,
-                        hide_header: true,
-                        on_start_call: start_call.clone(),
-                        on_open_thread: open_thread,
-                        on_open_profile: open_profile,
-                        on_open_room_info: open_room_info.clone(),
+                    // Conversation's timeline effects, history resource, and
+                    // memos bind at MOUNT, so switching rooms must remount it.
+                    // Dioxus only honors `key` on the first node of a
+                    // conditional branch (mid-block keys are ignored), so the
+                    // key must live here — the branch's root — not on the
+                    // shared wrapper above.
+                    div { key: "{c.id}", style: "flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;",
+                        FocusHeader {
+                            convo: c.clone(),
+                            on_open_nav: move |_| ui.nav_open.set(!(ui.nav_open)()),
+                            on_open_switcher: move |_| ui.switcher_open.set(true),
+                            on_open_room_info: open_room_info.clone(),
+                        }
+                        Conversation {
+                            convo: c.clone(),
+                            is_mobile: false,
+                            hide_header: true,
+                            on_open_thread: open_thread,
+                            on_open_profile: open_profile,
+                            on_open_room_info: open_room_info.clone(),
+                        }
                     }
                 } else {
                     // Window controls normally live in FocusHeader, which is only
@@ -330,7 +348,6 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                             ProfilePanel {
                                 target,
                                 on_close: move |_| ui.side_panel.set(None),
-                                on_start_call: start_call.clone(),
                                 on_message: message_target,
                             }
                         },
@@ -349,7 +366,19 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                     on_open_settings: move |_| { ui.nav_open.set(false); navigator.push(Route::SettingsPage {}); },
                     on_open_self: {
                         let me = me.clone();
-                        move |_| { ui.nav_open.set(false); ui.side_panel.set(Some(SidePanel::Profile { target: me.as_ref().map(ProfileTarget::own).unwrap_or_else(|| ProfileTarget::person("You", "@you:vesper.chat")) })); }
+                        move |_| { ui.nav_open.set(false); ui.side_panel.set(Some(SidePanel::Profile { target: me.as_ref().map(ProfileTarget::own).unwrap_or_else(|| ProfileTarget {
+                            // Signed-in account hasn't loaded yet — no
+                            // fabricated MXID, no assumed presence.
+                            id: None,
+                            name: "You".into(),
+                            mxid: None,
+                            status: None,
+                            is_room: false,
+                            topic: None,
+                            members: None,
+                            encrypted: false,
+                            avatar: None,
+                        }) })); }
                     },
                     on_leave: leave_room,
                     me_avatar: me_avatar.clone(),
@@ -358,9 +387,6 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
             }
             if (ui.switcher_open)() {
                 Switcher { dms, rooms, on_close: move |_| ui.switcher_open.set(false), on_select: select_convo }
-            }
-            if let Some(call) = ui.call.read().clone() {
-                CallScreen { call, on_end: move |_| ui.call.set(None) }
             }
         }
     }

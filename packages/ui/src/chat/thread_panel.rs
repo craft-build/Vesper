@@ -61,7 +61,12 @@ pub fn ThreadPanel(
         let convo_id = convo_id.clone();
         let root_id = root_id.clone();
         spawn(async move {
-            client.send_thread_reply(&convo_id, &root_id, text).await;
+            // Hard send failures aren't painted anywhere (thread rows have
+            // no send-state): surface them as a toast, like failed
+            // attachment saves in the conversation view.
+            if let Err(e) = client.send_thread_reply(&convo_id, &root_id, text).await {
+                use_context::<crate::design_system::ToastCenter>().error(&e);
+            }
         });
     };
 

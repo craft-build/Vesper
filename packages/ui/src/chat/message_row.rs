@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
 use dioxus::prelude::*;
 
 use crate::chat::use_media_src;
@@ -11,7 +14,10 @@ const EMOJI_CHOICES: [&str; 6] = ["👍", "❤️", "😂", "🎉", "✅", "👀
 #[component]
 pub fn MessageRow(
     m: Message,
-    all_messages: Vec<Message>,
+    /// Reply-quote lookup keyed by event id, shared Rc-wide across all rows
+    /// (one build per publish — an `Rc` clone is a refcount bump, and
+    /// `Rc::ptr_eq` lets unchanged rows skip the deep prop compare).
+    all_messages: Rc<BTreeMap<String, Message>>,
     on_react: EventHandler<(String, String)>,
     on_reply: EventHandler<Message>,
     on_retry_send: EventHandler<String>,
@@ -49,10 +55,7 @@ pub fn MessageRow(
         };
     }
 
-    let reply_src = m
-        .reply_to
-        .as_ref()
-        .and_then(|id| all_messages.iter().find(|x| &x.id == id));
+    let reply_src = m.reply_to.as_ref().and_then(|id| all_messages.get(id));
     let side = if m.mine { "left" } else { "right" };
     let bubble_bg = if m.mine {
         "var(--bg-brand)"
