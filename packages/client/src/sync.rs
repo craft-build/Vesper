@@ -497,29 +497,53 @@ async fn map_item(
     use matrix_sdk::RoomMemberships;
     let is_dm = item.is_direct().await.unwrap_or(false);
     let counts = item.unread_notification_counts();
-    // DM counterpart: the other joined member. Falls back to `None` when
-    // member state hasn't synced yet — the dot stays Offline until it does.
-    // The DM avatar overrides the room avatar with the counterpart's
-    // (checkpoint 07).
+    // DM counterpart: prefer the room's `m.direct` target, which remains
+    // available even when lazy-loaded member state hasn't arrived (or the
+    // other user has left). Joined members are only a fallback. Presence
+    // polling needs this stable MXID; deriving it solely from `members()`
+    // left every dot Offline whenever sliding sync had not loaded members.
+    // The DM avatar still prefers the matching member profile (checkpoint 07).
     let (mxid, status, avatar) = if is_dm {
+        let mut direct_targets: Vec<_> = item
+            .direct_targets()
+            .into_iter()
+            .filter_map(|target| target.into_user_id())
+            .filter(|target| own_id.is_none_or(|own| own != target))
+            .collect();
+        direct_targets.sort_unstable();
+        let direct_other = direct_targets.into_iter().next();
         match item.members(RoomMemberships::JOIN).await {
             Ok(members) => {
-                let other = members
+                let member_other = members
                     .iter()
                     .find(|m| own_id.is_none_or(|o| o != m.user_id()));
+                let other_id =
+                    direct_other.or_else(|| member_other.map(|m| m.user_id().to_owned()));
+                let other_member = other_id
+                    .as_ref()
+                    .and_then(|id| members.iter().find(|m| m.user_id() == id))
+                    .or(member_other);
                 // `item.avatar_url()` is DM-aware (counterpart avatar) —
                 // use it whenever the counterpart's member profile is
                 // missing or has no avatar of its own.
-                let avatar = other
+                let avatar = other_member
                     .and_then(|m| m.avatar_url().map(|u| u.to_string()))
                     .or_else(|| item.avatar_url().map(|u| u.to_string()));
-                let other = other.map(|m| m.user_id().to_owned());
-                let other_ref = other.as_ref();
+                let other_ref = other_id.as_ref();
                 let status =
                     other_ref.and_then(|id| presence_signal.peek().get(id.as_str()).copied());
-                (other.map(|u| u.to_string()), status, avatar)
+                (other_id.map(|u| u.to_string()), status, avatar)
             }
-            Err(_) => (None, None, None),
+            Err(_) => {
+                let status = direct_other
+                    .as_ref()
+                    .and_then(|id| presence_signal.peek().get(id.as_str()).copied());
+                (
+                    direct_other.map(|u| u.to_string()),
+                    status,
+                    item.avatar_url().map(|u| u.to_string()),
+                )
+            }
         }
     } else {
         (None, None, item.avatar_url().map(|u| u.to_string()))

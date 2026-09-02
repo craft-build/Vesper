@@ -23,7 +23,7 @@ use matrix_sdk::ruma::presence::PresenceState;
 use matrix_sdk::{
     ruma::{
         self,
-        api::client::presence::get_presence,
+        api::client::presence::{get_presence, set_presence},
         events::room::message::{MessageType, RoomMessageEventContent},
         events::SyncMessageLikeEvent,
         OwnedRoomId, RoomId, UserId,
@@ -43,6 +43,11 @@ const TYPING_IDLE_RESET: Duration = Duration::from_secs(4);
 /// How often the presence poll refreshes DM counterparts' presence over
 /// `GET /presence/{userId}/status` (see [`poll_dm_presence`]).
 const PRESENCE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Simplified sliding sync doesn't carry the classic `/sync` `set_presence`
+/// query parameter. Refresh our own presence explicitly so other Matrix
+/// clients don't continue to see a logged-in Vesper user as offline.
+const PRESENCE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Manages outgoing typing notices per room with a 4s idle reset.
 ///
@@ -191,6 +196,7 @@ impl Drop for AbortOnDrop {
 pub struct LiveHandles {
     presence: EventHandlerDropGuard,
     presence_poll: AbortOnDrop,
+    presence_heartbeat: AbortOnDrop,
     #[cfg(not(target_arch = "wasm32"))]
     notify: EventHandlerDropGuard,
 }
@@ -200,11 +206,13 @@ pub struct LiveHandles {
 pub fn start_live(client: &Client, state: ClientState) -> LiveHandles {
     let presence = start_presence(client, state);
     let presence_poll = spawn_presence_poll(client, state);
+    let presence_heartbeat = spawn_presence_heartbeat(client);
     #[cfg(not(target_arch = "wasm32"))]
     let notify = start_notifications(client, state);
     LiveHandles {
         presence,
         presence_poll,
+        presence_heartbeat,
         #[cfg(not(target_arch = "wasm32"))]
         notify,
     }
@@ -260,6 +268,28 @@ fn spawn_presence_poll(client: &Client, state: ClientState) -> AbortOnDrop {
                 interval = PRESENCE_POLL_INTERVAL;
             }
             tokio::time::sleep(interval).await;
+        }
+    });
+    AbortOnDrop(Some(task.abort_handle()))
+}
+
+/// Keep this session visible to other users while simplified sliding sync is
+/// running. Unlike classic `/sync`, MSC4186 requests don't refresh the
+/// account's presence, so only polling other users fixes half of the flow:
+/// every Vesper user would still be reported as offline to everyone else.
+fn spawn_presence_heartbeat(client: &Client) -> AbortOnDrop {
+    let client = client.clone();
+    let task = tokio::spawn(async move {
+        let Some(user_id) = client.user_id().map(ToOwned::to_owned) else {
+            return;
+        };
+        loop {
+            let request = set_presence::v3::Request::new(user_id.clone(), PresenceState::Online);
+            match client.send(request).await {
+                Ok(_) => tracing::debug!(%user_id, "presence heartbeat sent"),
+                Err(e) => tracing::debug!(%user_id, "presence heartbeat failed: {e}"),
+            }
+            tokio::time::sleep(PRESENCE_HEARTBEAT_INTERVAL).await;
         }
     });
     AbortOnDrop(Some(task.abort_handle()))
