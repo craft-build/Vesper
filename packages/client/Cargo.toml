@@ -2,6 +2,7 @@
 name = "client"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [features]
 # Everything that links matrix-sdk. Native builds use this; wasm (`web`)

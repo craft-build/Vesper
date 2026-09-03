@@ -27,7 +27,7 @@ use crate::data::{Message, ThreadReply};
 #[derive(Clone, PartialEq)]
 pub enum SidePanel {
     Thread {
-        root: Option<Message>,
+        root: Box<Option<Message>>,
         /// Event id of the thread's root message — the key for the live
         /// threads map even when `root` failed to resolve.
         root_id: String,

@@ -28,6 +28,7 @@ use matrix_sdk::{
     authentication::matrix::MatrixSession, ruma::api::error::ErrorKind, Client, ClientBuildError,
     HttpError, ThreadingSupport,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     api::ClientError,
@@ -235,6 +236,14 @@ fn map_build_error(e: &ClientBuildError) -> ClientError {
 /// well-known discovery finds the client API URL) with the persistent sqlite
 /// store attached. Discovery/network failures surface here.
 async fn build_client(homeserver: &str) -> Result<Client, ClientError> {
+    build_client_inner(homeserver, false).await
+}
+
+async fn build_client_from_url(homeserver_url: &str) -> Result<Client, ClientError> {
+    build_client_inner(homeserver_url, true).await
+}
+
+async fn build_client_inner(homeserver: &str, direct_url: bool) -> Result<Client, ClientError> {
     let store_dir = store_dir()?;
     std::fs::create_dir_all(&store_dir)
         .map_err(|e| ClientError::storage(format!("Could not create data directory: {e}")))?;
@@ -243,8 +252,12 @@ async fn build_client(homeserver: &str) -> Result<Client, ClientError> {
     // when created fresh; see [`store_passphrase`] for the legacy branch.
     let passphrase = store_passphrase()?;
 
-    Client::builder()
-        .server_name_or_homeserver_url(homeserver)
+    let builder = if direct_url {
+        Client::builder().homeserver_url(homeserver)
+    } else {
+        Client::builder().server_name_or_homeserver_url(homeserver)
+    };
+    builder
         .sqlite_store(&store_dir, passphrase.as_deref())
         .handle_refresh_tokens()
         // Enable thread support so the event cache tracks thread roots and
@@ -261,11 +274,23 @@ async fn build_client(homeserver: &str) -> Result<Client, ClientError> {
         .map_err(|e| map_build_error(&e))
 }
 
-/// Persist the session blob into the OS keyring (file fallback with a loud
-/// warning; any legacy `session.json` is removed — checkpoint 11).
-fn save_session(session: &MatrixSession) -> Result<(), ClientError> {
+#[derive(Serialize, Deserialize)]
+struct StoredSession {
+    /// The discovered client API URL. Persisting it lets restore open the
+    /// local store without repeating `.well-known` discovery while offline.
+    homeserver: String,
+    session: MatrixSession,
+}
+
+/// Persist the session blob and discovered homeserver URL into the OS keyring
+/// (file fallback with a loud warning; any legacy `session.json` is removed).
+fn save_session(session: &MatrixSession, homeserver: &str) -> Result<(), ClientError> {
     let path = session_path()?;
-    let json = serde_json::to_string(session)
+    let stored = StoredSession {
+        homeserver: homeserver.to_owned(),
+        session: session.clone(),
+    };
+    let json = serde_json::to_string(&stored)
         .map_err(|e| ClientError::storage(format!("Could not serialize session: {e}")))?;
     secrets::save(Secret::Session, &json, &path)
 }
@@ -340,17 +365,33 @@ pub async fn connect_login(
     client
         .matrix_auth()
         .login_username(&user_id, &password)
-        .initial_device_display_name("Vesper (macOS)")
+        .initial_device_display_name(device_display_name())
         .send()
         .await
         .map_err(|e| friendly_error(&e))?;
 
     if let Some(session) = client.matrix_auth().session() {
-        save_session(&session)?;
+        save_session(&session, client.homeserver().as_str())?;
     }
 
     let me = me_snapshot(&client).await;
     Ok((client, me))
+}
+
+fn device_display_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Vesper (macOS)"
+    } else if cfg!(target_os = "windows") {
+        "Vesper (Windows)"
+    } else if cfg!(target_os = "linux") {
+        "Vesper (Linux)"
+    } else if cfg!(target_os = "android") {
+        "Vesper (Android)"
+    } else if cfg!(target_os = "ios") {
+        "Vesper (iOS)"
+    } else {
+        "Vesper"
+    }
 }
 
 /// Restore a persisted session. `Ok(None)` means no session file exists — the
@@ -359,10 +400,9 @@ pub async fn connect_login(
 /// Deletion policy: the stored session (and the sqlite store holding this
 /// device's crypto state) is only purged when the server says the token is
 /// *dead* — corrupt files, invalid sessions, explicit auth failures. A
-/// transient failure (offline, 5xx, captive portal) instead returns `Err`
-/// with the files untouched, so the next launch retries the same device
-/// rather than orphaning it. `App` turns either `Err` into the login screen
-/// (with a warn log), never a panic.
+/// transient validation failure (offline, 5xx, captive portal) restores the
+/// cached identity and starts sync in reconnecting mode, keeping cached rooms
+/// navigable without orphaning the device.
 pub async fn connect_restore() -> Result<Option<(Client, Me)>, ClientError> {
     // Keyring first; a legacy `session.json` is migrated + deleted inside
     // `secrets::load` (checkpoint 11). `None` = fresh install / clean
@@ -371,32 +411,62 @@ pub async fn connect_restore() -> Result<Option<(Client, Me)>, ClientError> {
     let Some(json) = json else {
         return Ok(None);
     };
-    let session: MatrixSession = serde_json::from_str(&json).map_err(|_| {
-        cleanup_files();
-        ClientError::storage("Stored session could not be read — please sign in again.")
-    })?;
+    let (session, homeserver_url) = match serde_json::from_str::<StoredSession>(&json) {
+        Ok(stored) => (stored.session, Some(stored.homeserver)),
+        Err(_) => {
+            // Migration from releases that stored a bare MatrixSession. It
+            // still needs discovery once; the successful restore below
+            // rewrites it in the offline-capable format.
+            let legacy = serde_json::from_str::<MatrixSession>(&json).map_err(|_| {
+                cleanup_error_or(ClientError::storage(
+                    "Stored session could not be read — please sign in again.",
+                ))
+            })?;
+            (legacy, None)
+        }
+    };
 
+    let restored_user_id = session.meta.user_id.to_string();
     let homeserver = session.meta.user_id.server_name().to_string();
-    let client = build_client(&homeserver).await?;
-    client.restore_session(session).await.map_err(|e| {
-        cleanup_files();
-        friendly_error(&e)
-    })?;
+    let client = match homeserver_url {
+        Some(url) => build_client_from_url(&url).await?,
+        None => build_client(&homeserver).await?,
+    };
+    client
+        .restore_session(session)
+        .await
+        .map_err(|e| cleanup_error_or(friendly_error(&e)))?;
 
     if let Err(e) = client.whoami().await {
         if is_auth_failure(e.client_api_error_kind()) {
-            cleanup_files();
+            cleanup_files()?;
+            return Err(friendly_http_error(&e));
         }
-        return Err(friendly_http_error(&e));
+        tracing::warn!("session validation unavailable; restoring cached account: {e}");
+        return Ok(Some((client, fallback_me(&restored_user_id))));
     }
 
     // Tokens may have rotated during restore; rewrite the file so it stays fresh.
     if let Some(fresh) = client.matrix_auth().session() {
-        let _ = save_session(&fresh);
+        let _ = save_session(&fresh, client.homeserver().as_str());
     }
 
     let me = me_snapshot(&client).await;
     Ok(Some((client, me)))
+}
+
+fn fallback_me(user_id: &str) -> Me {
+    let name = user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split(':').next())
+        .filter(|local| !local.is_empty())
+        .unwrap_or(user_id)
+        .to_owned();
+    Me {
+        name,
+        id: user_id.to_owned(),
+        avatar: None,
+    }
 }
 
 /// End the session remotely, then clear all local artifacts (session file and
@@ -419,25 +489,56 @@ pub async fn logout(client: Option<Client>) -> Result<(), ClientError> {
         }
         drop(client);
     }
-    cleanup_files();
-    Ok(())
+    cleanup_files()
 }
 
-fn cleanup_files() {
+fn cleanup_error_or(fallback: ClientError) -> ClientError {
+    cleanup_files().err().unwrap_or(fallback)
+}
+
+fn cleanup_files() -> Result<(), ClientError> {
+    let mut failures = Vec::new();
     // Keyring entries die with the session too (checkpoint 11): a stale
     // entry must never resurrect a logged-out device's tokens.
-    if let (Ok(session), Ok(pass)) = (session_path(), passphrase_path()) {
-        secrets::delete(Secret::Session, &session);
-        secrets::delete(Secret::StorePassphrase, &pass);
-    }
-    let mut paths = vec![session_path(), passphrase_path(), prefs_path(), store_dir()];
-    for result in paths.drain(..) {
-        let Ok(path) = result else { continue };
-        if path.is_dir() {
-            let _ = std::fs::remove_dir_all(&path);
-        } else {
-            let _ = std::fs::remove_file(&path);
+    for (secret, path) in [
+        (Secret::Session, session_path()),
+        (Secret::StorePassphrase, passphrase_path()),
+    ] {
+        match path {
+            Ok(path) => {
+                if let Err(e) = secrets::delete(secret, &path) {
+                    failures.push(e.message);
+                }
+            }
+            Err(e) => failures.push(e.message),
         }
+    }
+
+    for (label, result) in [("preferences", prefs_path()), ("crypto store", store_dir())] {
+        match result {
+            Ok(path) => {
+                let removal = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                if let Err(e) = removal {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        failures.push(format!("{label} deletion failed: {e}"));
+                    }
+                }
+            }
+            Err(e) => failures.push(e.message),
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ClientError::storage(format!(
+            "Signed out, but some local credentials or account data could not be removed: {}",
+            failures.join("; ")
+        )))
     }
 }
 
@@ -480,6 +581,18 @@ pub(crate) mod tests {
         ))));
         assert!(!is_auth_failure(Some(&ErrorKind::Unknown)));
         assert!(!is_auth_failure(None));
+    }
+
+    #[test]
+    fn offline_identity_falls_back_to_mxid_localpart() {
+        assert_eq!(
+            fallback_me("@alice:example.org"),
+            Me {
+                name: "alice".into(),
+                id: "@alice:example.org".into(),
+                avatar: None,
+            }
+        );
     }
 
     // `store_passphrase` reads the data dir from the environment at call
@@ -532,7 +645,7 @@ pub(crate) mod tests {
         with_data_dir(|_| {
             store_passphrase().expect("generate");
             assert!(passphrase_path().expect("path").exists());
-            cleanup_files();
+            cleanup_files().expect("cleanup");
             assert!(!passphrase_path().expect("path").exists());
         });
     }
@@ -636,7 +749,7 @@ pub(crate) mod tests {
         with_data_dir(|_| {
             save_prefs(&Prefs::default()).expect("save");
             assert!(prefs_path().expect("path").exists());
-            cleanup_files();
+            cleanup_files().expect("cleanup");
             assert!(!prefs_path().expect("path").exists());
         });
     }

@@ -1,68 +1,66 @@
-# Development
+# Vesper
 
-Your new workspace contains a member crate for each of the web, desktop and mobile platforms, a `ui` crate for shared components and a `client` crate for the Matrix bridge:
+Vesper is a Matrix chat client built with Rust, Dioxus 0.7, and
+`matrix-sdk`. The first release targets macOS desktop. The web crate is a
+mock-backed UI preview, and Android/iOS packaging is not yet release-ready.
 
-```
-your_project/
-├─ README.md
-├─ Cargo.toml
-└─ packages/
-   ├─ web/
-   │  └─ ... # Web specific UI/logic
-   ├─ desktop/
-   │  └─ ... # Desktop specific UI/logic
-   ├─ mobile/
-   │  └─ ... # Mobile specific UI/logic
-   ├─ client/
-   │  └─ ... # Matrix bridge (matrix-sdk) — no server side; homeservers are the backend
-   └─  ui/
-      └─ ... # Component shared between multiple platforms
-```
+## Workspace
 
-## Platform crates
+- `packages/client` — Matrix SDK integration, session storage, sync, timelines,
+  encryption, media, and notifications.
+- `packages/ui` — shared Dioxus application and design system.
+- `packages/desktop` — desktop launcher, diagnostics, and bundle configuration.
+- `packages/mobile` — mobile launcher (development only).
+- `packages/web` — mock-backed web preview; it does not connect to Matrix.
+- `docs` — implementation checkpoints and release-hardening decisions.
 
-Each platform crate contains the entry point for the platform, and any assets, components and dependencies that are specific to that platform. For example, the desktop crate in the workspace looks something like this:
+## Prerequisites
 
-```
-desktop/ # The desktop crate contains all platform specific UI, logic and dependencies for the desktop app
-├─ assets/ # Assets used by the desktop app - Any platform specific assets should go in this folder
-├─ src/
-│  ├─ main.rs # The entrypoint for the desktop app. It also defines the routes for the desktop platform
-│  ├─ views/ # The views each route will render in the desktop version of the app
-│  │  ├─ mod.rs # Defines the module for the views route and re-exports the components for each route
-│  │  ├─ blog.rs # The component that will render at the /blog/:id route
-│  │  ├─ home.rs # The component that will render at the / route
-├─ Cargo.toml # The desktop crate's Cargo.toml - This should include all desktop specific dependencies
-```
+- A current stable Rust toolchain
+- Dioxus CLI 0.7:
 
-When you start developing with the workspace setup each of the platform crates will look almost identical. The UI starts out exactly the same on all platforms. However, as you continue developing your application, this setup makes it easy to let the views for each platform change independently.
+  ```sh
+  cargo install dioxus-cli --version '^0.7'
+  ```
 
-## Shared UI crate
+## Run the desktop app
 
-The workspace contains a `ui` crate with components that are shared between multiple platforms. You should put any UI elements you want to use in multiple platforms in this crate. You can also put some shared client side logic in this crate, but be careful to not pull in platform specific dependencies. The `ui` crate starts out something like this:
-
-```
-ui/
-├─ src/
-│  ├─ lib.rs # The entrypoint for the ui crate
-│  ├─ hero.rs # The Hero component that will be used in every platform
-│  ├─ echo.rs # The shared echo component
-│  ├─ navbar.rs # The Navbar component that will be used in the layout of every platform's router
-```
-
-## Matrix bridge
-
-There is no server side — Matrix homeservers are the backend. The `client` crate wraps `matrix-sdk` behind a tokio runtime bridge (`ClientRuntime` + an unbounded command channel) so the Dioxus UI never has to host an async runtime itself. It is currently compiled standalone and not yet wired into `ui`.
-
-### Serving Your App
-
-Navigate to the platform crate of your choice:
-```bash
-cd desktop
-```
-
-and serve:
-
-```bash
+```sh
+cd packages/desktop
 dx serve
 ```
+
+Vesper stores application data in the platform data directory. Set
+`VESPER_DATA_DIR` to override it for isolated development runs. On macOS and
+Windows, credentials use the OS keyring; unsupported or unavailable keyrings
+fall back to owner-only files and emit a warning.
+
+## Quality checks
+
+Run these from the workspace root:
+
+```sh
+cargo fmt --all -- --check
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo audit
+```
+
+## Build the macOS bundle
+
+```sh
+cd packages/desktop
+dx bundle --platform desktop --release
+```
+
+Bundle metadata lives in `packages/desktop/Dioxus.toml`. Signing,
+notarization, and distribution-channel policy must be completed before a
+public release. See `docs/11-hardening.md` for the current readiness status and
+known platform limitations.
+
+## License
+
+Vesper is licensed under either of the following, at your option:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))

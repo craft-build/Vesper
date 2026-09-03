@@ -44,23 +44,6 @@ impl From<Convo> for ProfileTarget {
 }
 
 impl ProfileTarget {
-    pub fn person(name: impl Into<String>, mxid: impl Into<String>) -> Self {
-        Self {
-            // `id: None` = identity not yet resolved against the backend
-            // (contract review): presence stays unknown too — the panel must
-            // not fabricate an Online dot for an unresolved mention.
-            id: None,
-            name: name.into(),
-            mxid: Some(mxid.into()),
-            status: None,
-            is_room: false,
-            topic: None,
-            members: None,
-            encrypted: false,
-            avatar: None,
-        }
-    }
-
     /// The signed-in user's own profile (nav drawer "You" button,
     /// checkpoint 07): carries the account avatar MXC when known.
     pub fn own(me: &Me) -> Self {

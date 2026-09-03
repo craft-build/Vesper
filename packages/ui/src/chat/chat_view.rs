@@ -97,7 +97,7 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                 };
                 let thread = client.thread(&room_id, &message_id).await;
                 ui.side_panel.set(Some(SidePanel::Thread {
-                    root,
+                    root: Box::new(root),
                     root_id: message_id,
                     thread,
                 }));
@@ -146,7 +146,7 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
     };
 
     let message_target = {
-        let mut select_convo = select_convo.clone();
+        let mut select_convo = select_convo;
         move |target: ProfileTarget| {
             ui.side_panel.set(None);
             if let Some(id) = target.id.clone() {
@@ -165,7 +165,6 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
     let leave_room = {
         let client = client.clone();
         let active_id = active_id.clone();
-        let navigator = navigator.clone();
         move |id: String| {
             if active_id == id {
                 navigator.push(Route::Home {});
@@ -198,7 +197,6 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
     // unrelated re-render never dirties the notification task's read; cleared
     // on unmount only if it still points at this room.
     use_effect({
-        let sync = sync;
         let active_id = active_id.clone();
         move || {
             let mut active_room = sync.active_room;
@@ -208,7 +206,6 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
         }
     });
     use_drop({
-        let sync = sync;
         let active_id = active_id.clone();
         move || {
             let mut active_room = sync.active_room;
@@ -261,7 +258,7 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                     rooms: rooms.clone(),
                     spaces: spaces.clone(),
                     active_id: active_id.clone(),
-                    on_select: select_convo.clone(),
+                    on_select: select_convo,
                     on_close: move |_| ui.nav_open.set(false),
                     on_open_discovery: move |_| ui.discovery_open.set(true),
                     // Settings replaces ChatView, so the drawer disappears
@@ -342,7 +339,7 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                     match panel {
                         SidePanel::Thread { root, root_id, thread } => rsx! {
                             ThreadPanel {
-                                root_message: root,
+                                root_message: *root,
                                 root_id,
                                 thread,
                                 convo_id: convo.as_ref().map(|c| c.id.clone()).unwrap_or_default(),
@@ -365,7 +362,7 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                     rooms: rooms.clone(),
                     spaces: spaces.clone(),
                     active_id: active_id.clone(),
-                    on_select: select_convo.clone(),
+                    on_select: select_convo,
                     on_close: move |_| ui.nav_open.set(false),
                     on_open_discovery: move |_| ui.discovery_open.set(true),
                     on_open_settings: move |_| {

@@ -22,7 +22,6 @@ pub fn Avatar(
     );
     let src = src.or(resolved);
     let initials: String = name
-        .trim()
         .split_whitespace()
         .take(2)
         .filter_map(|w| w.chars().next())

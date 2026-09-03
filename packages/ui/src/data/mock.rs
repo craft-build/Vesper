@@ -67,6 +67,7 @@ fn dm(id: &str, name: &str, mxid: &str, status: Presence, last: &str, unread: u3
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Compact, readable fixture constructor.
 fn room(
     id: &str,
     space: &str,
@@ -657,7 +658,7 @@ impl VesperClient for MockClient {
         text: String,
         attachment: Option<Attachment>,
         reply_to: Option<String>,
-    ) -> Message {
+    ) -> Result<Message, ClientError> {
         let mut state = self.state.borrow_mut();
         let id = state.next_id;
         state.next_id += 1;
@@ -682,7 +683,7 @@ impl VesperClient for MockClient {
             .entry(convo_id.to_string())
             .or_default()
             .push(message.clone());
-        message
+        Ok(message)
     }
 
     async fn send_thread_reply(
@@ -713,13 +714,18 @@ impl VesperClient for MockClient {
         Ok(reply)
     }
 
-    async fn react(&self, convo_id: &str, message_id: &str, emoji: &str) -> Vec<Reaction> {
+    async fn react(
+        &self,
+        convo_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<Vec<Reaction>, ClientError> {
         let mut state = self.state.borrow_mut();
         let Some(messages) = state.messages.get_mut(convo_id) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(message) = messages.iter_mut().find(|m| m.id == message_id) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         match message.reactions.iter().position(|r| r.emoji == emoji) {
             Some(idx) => {
@@ -741,7 +747,7 @@ impl VesperClient for MockClient {
                 me: true,
             }),
         }
-        message.reactions.clone()
+        Ok(message.reactions.clone())
     }
 
     async fn retry_send(&self, _convo_id: &str, _message_id: &str) -> Result<(), ClientError> {

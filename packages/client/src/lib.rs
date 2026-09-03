@@ -201,22 +201,19 @@ mod matrix_impl {
             text: String,
             attachment: Option<Attachment>,
             reply_to: Option<String>,
-        ) -> Message {
-            let send_state = self
-                .ask(move |reply| Command::SendMessage {
-                    room_id: convo_id.to_string(),
-                    text,
-                    attachment,
-                    reply_to,
-                    reply,
-                })
-                .await
-                .map(|_| SendState::Sending)
-                .unwrap_or(SendState::Failed);
+        ) -> Result<Message, ClientError> {
+            self.ask(move |reply| Command::SendMessage {
+                room_id: convo_id.to_string(),
+                text,
+                attachment,
+                reply_to,
+                reply,
+            })
+            .await?;
             let mut stub = Message::new(String::new(), "", "", "");
             stub.mine = true;
-            stub.send_state = send_state;
-            stub
+            stub.send_state = SendState::Sending;
+            Ok(stub)
         }
         // Checkpoint 05: like `send_message`, the painted row comes from
         // the live thread timeline's diff stream — the returned value is a
@@ -243,7 +240,12 @@ mod matrix_impl {
                 text,
             })
         }
-        async fn react(&self, convo_id: &str, message_id: &str, emoji: &str) -> Vec<Reaction> {
+        async fn react(
+            &self,
+            convo_id: &str,
+            message_id: &str,
+            emoji: &str,
+        ) -> Result<Vec<Reaction>, ClientError> {
             self.ask(move |reply| Command::ToggleReaction {
                 room_id: convo_id.to_string(),
                 event_id: message_id.to_string(),
@@ -251,10 +253,6 @@ mod matrix_impl {
                 reply,
             })
             .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("react: {}", e);
-                Vec::new()
-            })
         }
         async fn retry_send(&self, convo_id: &str, message_id: &str) -> Result<(), ClientError> {
             self.ask(move |reply| Command::RetrySend {

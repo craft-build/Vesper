@@ -41,7 +41,8 @@ use crate::{
 /// Build the ruma media source for an MXC URI, parsing the serialized
 /// `EncryptedFile` JSON when the piece of media is encrypted.
 fn media_source(mxc: &str, encrypted: Option<&str>) -> Result<MediaSource, ClientError> {
-    let uri = OwnedMxcUri::try_from(mxc)
+    let uri = OwnedMxcUri::from(mxc);
+    uri.validate()
         .map_err(|_| ClientError::invalid(format!("Could not use the media URI '{mxc}'.")))?;
     match encrypted {
         None => Ok(MediaSource::Plain(uri)),
@@ -189,6 +190,7 @@ pub struct MappedMedia {
 
 /// Shared mapping core: `name` = `filename` when set (else `body`), `size`
 /// from info when known.
+#[allow(clippy::too_many_arguments)] // Mirrors the independent Matrix media metadata fields.
 fn mapped(
     kind: AttachmentKind,
     body: String,
@@ -498,7 +500,7 @@ mod tests {
 
     #[test]
     fn split_source_plain_and_encrypted_roundtrip() {
-        let plain = MediaSource::Plain(OwnedMxcUri::try_from("mxc://example/abc").unwrap());
+        let plain = MediaSource::Plain(OwnedMxcUri::from("mxc://example/abc"));
         let (mxc, enc) = split_source(&plain);
         assert_eq!(mxc.as_deref(), Some("mxc://example/abc"));
         assert!(enc.is_none());
@@ -508,5 +510,11 @@ mod tests {
             panic!("expected a plain source");
         };
         assert_eq!(uri.as_str(), "mxc://example/abc");
+    }
+
+    #[test]
+    fn media_source_rejects_invalid_mxc_uri() {
+        let err = media_source("https://example.com/image.png", None).expect_err("not an MXC URI");
+        assert_eq!(err.kind, crate::api::ClientErrorKind::Invalid);
     }
 }

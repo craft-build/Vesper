@@ -1,6 +1,8 @@
 use dioxus::prelude::*;
 
-use crate::data::{Attachment, AttachmentKind, Message};
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+use crate::data::AttachmentKind;
+use crate::data::{Attachment, Message};
 use crate::design_system::{Button, ButtonSize, IconButton};
 use crate::icons::{Icon, IconName};
 

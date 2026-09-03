@@ -729,6 +729,7 @@ fn client_bytes_label(bytes: u64) -> String {
 
 /// Escape a Rust string into a JS string literal (no serde_json dep in
 /// this crate; the payload is plain text with newlines and quotes).
+#[cfg(not(target_arch = "wasm32"))]
 fn js_string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');

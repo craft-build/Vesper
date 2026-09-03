@@ -1282,6 +1282,7 @@ mod tests {
     // land in the data dir (the runtime answers them inline; no login needed
     // because prefs are device-local, not session-bound).
     #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // Serializes process-global env changes for the whole test.
     async fn prefs_round_trip_through_runtime() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = crate::session::tests::ENV_LOCK

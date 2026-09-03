@@ -258,14 +258,16 @@ pub trait VesperClient {
     /// Send a text message into `convo_id`, optionally as an in-reply-to on
     /// `reply_to` (the message row id). The returned `Message` is only a
     /// bookkeeping stub — the painted row comes from the backend's live
-    /// timeline (or, for the mock, from its own store).
+    /// timeline (or, for the mock, from its own store). Hard failures are
+    /// returned so the composer can surface them; queued sends still succeed
+    /// and expose their state through the live timeline.
     async fn send_message(
         &self,
         convo_id: &str,
         text: String,
         attachment: Option<Attachment>,
         reply_to: Option<String>,
-    ) -> Message;
+    ) -> Result<Message, ClientError>;
     /// Send a text reply in the thread rooted at `message_id` within
     /// `convo_id` (the room id is required to build the `m.thread` relation
     /// with the real backend). The returned `ThreadReply` is a bookkeeping
@@ -281,7 +283,12 @@ pub trait VesperClient {
     /// already present (toggle semantics). The returned aggregate may lag
     /// the toggle by one echo round-trip on the real backend; live rows
     /// repaint from the timeline diff stream instead.
-    async fn react(&self, convo_id: &str, message_id: &str, emoji: &str) -> Vec<Reaction>;
+    async fn react(
+        &self,
+        convo_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<Vec<Reaction>, ClientError>;
 
     /// Retry a failed/queued send identified by its message row id
     /// (no-op `Ok` in the mock).

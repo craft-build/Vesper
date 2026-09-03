@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 use super::composer::Composer;
 use super::message_row::MessageRow;
 use crate::data::{ClientState, Convo, ConvoKind, VesperClient};
-use crate::design_system::{Tag, TagTone};
+use crate::design_system::{Tag, TagTone, ToastCenter};
 use crate::icons::{Icon, IconName};
 
 #[component]
@@ -20,6 +20,7 @@ pub fn Conversation(
 ) -> Element {
     let client = use_context::<Rc<dyn VesperClient>>();
     let sync = use_context::<ClientState>();
+    let toasts = use_context::<ToastCenter>();
     let convo_id = convo.id.clone();
 
     // Checkpoint 04: the real backend live-publishes this room's timeline into
@@ -174,9 +175,12 @@ pub fn Conversation(
             let client = client.clone();
             let convo_id = convo_id.clone();
             spawn(async move {
-                client
+                if let Err(error) = client
                     .send_message(&convo_id, text, attachment, reply_to)
-                    .await;
+                    .await
+                {
+                    toasts.error(&error);
+                }
             });
         }
     };
@@ -221,7 +225,9 @@ pub fn Conversation(
             let client = client.clone();
             let convo_id = convo_id.clone();
             spawn(async move {
-                client.react(&convo_id, &message_id, &emoji).await;
+                if let Err(error) = client.react(&convo_id, &message_id, &emoji).await {
+                    toasts.error(&error);
+                }
             });
         }
     };

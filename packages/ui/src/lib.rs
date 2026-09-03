@@ -7,11 +7,11 @@ pub use app::App;
 
 pub mod data;
 
-mod icons;
+pub mod icons;
 mod markdown;
 mod window_chrome;
 
-mod design_system;
+pub mod design_system;
 
 mod chat;
 mod screens;

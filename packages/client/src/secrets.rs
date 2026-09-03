@@ -164,8 +164,14 @@ fn load_legacy(
     secret: Secret,
     legacy_path: &std::path::Path,
 ) -> Result<Option<String>, ClientError> {
-    let Ok(bytes) = std::fs::read(legacy_path) else {
-        return Ok(None);
+    let bytes = match std::fs::read(legacy_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(ClientError::storage(format!(
+                "Could not read stored credentials: {e}"
+            )))
+        }
     };
     let value = String::from_utf8(bytes)
         .map_err(|e| ClientError::storage(format!("Stored credentials are not readable: {e}")))?;
@@ -190,17 +196,33 @@ fn load_legacy(
 
 /// Remove `secret` from wherever it lives (keyring entry + legacy file).
 /// Logout is the caller; missing entries are success.
-pub(crate) fn delete(secret: Secret, legacy_path: &std::path::Path) {
+pub(crate) fn delete(secret: Secret, legacy_path: &std::path::Path) -> Result<(), ClientError> {
+    let mut failures = Vec::new();
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if let Some(entry) = keyring_entry(secret) {
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => {}
-            Err(e) => tracing::warn!("could not delete keyring entry: {e}"),
+    if keyring_enabled() {
+        match keyring_entry(secret) {
+            Some(entry) => match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(e) => failures.push(format!("keyring deletion failed: {e}")),
+            },
+            None => failures.push("the OS keyring could not be opened".into()),
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = secret;
-    let _ = std::fs::remove_file(legacy_path);
+    if let Err(e) = std::fs::remove_file(legacy_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            failures.push(format!("credential-file deletion failed: {e}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ClientError::storage(format!(
+            "Could not fully remove local credentials: {}",
+            failures.join("; ")
+        )))
+    }
 }
 
 /// Report which backend actually served the last op — surfaced in
@@ -247,7 +269,7 @@ mod tests {
                 load(Secret::StorePassphrase, &path).expect("load"),
                 Some("hunter2".into())
             );
-            delete(Secret::StorePassphrase, &path);
+            delete(Secret::StorePassphrase, &path).expect("delete");
             assert_eq!(load(Secret::StorePassphrase, &path).expect("load"), None);
         });
     }
@@ -260,6 +282,26 @@ mod tests {
                 load(Secret::Session, &dir.path().join("nope")).expect("load"),
                 None
             );
+        });
+    }
+
+    #[test]
+    fn load_io_failure_is_not_treated_as_missing() {
+        file_mode(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let err =
+                load(Secret::Session, dir.path()).expect_err("directory is not a secret file");
+            assert_eq!(err.kind, crate::api::ClientErrorKind::Storage);
+        });
+    }
+
+    #[test]
+    fn delete_reports_cleanup_failure() {
+        file_mode(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let err = delete(Secret::Session, dir.path())
+                .expect_err("a directory cannot be removed as a credential file");
+            assert_eq!(err.kind, crate::api::ClientErrorKind::Storage);
         });
     }
 

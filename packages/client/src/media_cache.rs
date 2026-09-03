@@ -256,10 +256,6 @@ mod tests {
         );
     }
 
-    fn size_of_dir(dir: &std::path::Path) -> u64 {
-        dir_size(&dir.join(DIR_NAME))
-    }
-
     #[test]
     fn eviction_removes_oldest_first() {
         let dir = tempfile::tempdir().expect("tempdir");
