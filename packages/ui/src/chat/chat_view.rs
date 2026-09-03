@@ -264,7 +264,12 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                     on_select: select_convo.clone(),
                     on_close: move |_| ui.nav_open.set(false),
                     on_open_discovery: move |_| ui.discovery_open.set(true),
-                    on_open_settings: move |_| { ui.nav_open.set(false); navigator.push(Route::SettingsPage {}); },
+                    // Settings replaces ChatView, so the drawer disappears
+                    // without mutating its preference. Returning restores the
+                    // exact open state the user navigated away from.
+                    on_open_settings: move |_| {
+                        navigator.push(Route::SettingsPage {});
+                    },
                     on_open_self: {
                         let me = me.clone();
                         move |_| { ui.nav_open.set(false); ui.side_panel.set(Some(SidePanel::Profile { target: me.as_ref().map(ProfileTarget::own).unwrap_or_else(|| ProfileTarget {
@@ -363,7 +368,9 @@ pub fn ChatView(#[props(default = None)] room_id: Option<String>) -> Element {
                     on_select: select_convo.clone(),
                     on_close: move |_| ui.nav_open.set(false),
                     on_open_discovery: move |_| ui.discovery_open.set(true),
-                    on_open_settings: move |_| { ui.nav_open.set(false); navigator.push(Route::SettingsPage {}); },
+                    on_open_settings: move |_| {
+                        navigator.push(Route::SettingsPage {});
+                    },
                     on_open_self: {
                         let me = me.clone();
                         move |_| { ui.nav_open.set(false); ui.side_panel.set(Some(SidePanel::Profile { target: me.as_ref().map(ProfileTarget::own).unwrap_or_else(|| ProfileTarget {
