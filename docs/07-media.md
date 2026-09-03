@@ -155,12 +155,13 @@ with progress and correct `m.image`/`m.file` events.
   the memory bound is a checkpoint-11 candidate (`Media::clean()`/retention
   policy exists). Avatars resolve at 128px. `MessageRow` renders inline
   images inside an aspect-ratio box from `info.{w,h}` (no layout jump) with
-  a placeholder icon while loading; clicking the image downloads full-size
-  — **no lightbox in v1** (scoped out deliberately).
-- **Downloads**: `MessageRow` file cards (and the image click) → rfd save
-  dialog on the UI thread → `save_attachment(convo_id, attachment, dest)`
-  writes the full-resolution bytes unchanged. Byte-exactness holds: no
-  re-encode on the download path.
+  a placeholder icon while loading. Clicking opens a modal viewer, which
+  keeps the thumbnail visible while it lazily resolves the full-size image;
+  full media is therefore not fetched merely by scrolling through history.
+- **Downloads**: `MessageRow` file cards and the image viewer's Download
+  action → rfd save dialog on the UI thread →
+  `save_attachment(convo_id, attachment, dest)` writes the full-resolution
+  bytes unchanged. Byte-exactness holds: no re-encode on the download path.
 - **Mapped but not interactive**: `m.video`/`m.audio` render as file cards
   (kinds `Video`/`Audio` exist for icons/labels; no players). Stickers,
   galleries (msc4274), and thread-panel reply avatars stay unmapped.

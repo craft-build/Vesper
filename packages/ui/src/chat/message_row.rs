@@ -12,6 +12,88 @@ use crate::markdown::render_markdown;
 const EMOJI_CHOICES: [&str; 6] = ["👍", "❤️", "😂", "🎉", "✅", "👀"];
 
 #[component]
+fn ImageViewer(
+    attachment: Attachment,
+    preview_src: Option<String>,
+    on_close: EventHandler<()>,
+    on_download: EventHandler<Attachment>,
+) -> Element {
+    // This component only mounts when the viewer is open, so resolving the
+    // unthumbnailed source never downloads full-size media during history
+    // scrolling.
+    let full_src = use_media_src(attachment.mxc.clone(), attachment.encrypted.clone(), None);
+    let display_src = full_src.as_ref().or(preview_src.as_ref());
+
+    rsx! {
+        div {
+            role: "presentation",
+            onclick: move |_| on_close.call(()),
+            style: "position:fixed;inset:0;z-index:100;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;padding:24px;",
+            div {
+                role: "dialog",
+                "aria-modal": "true",
+                "aria-label": "Image viewer",
+                tabindex: "0",
+                autofocus: true,
+                onkeydown: move |evt| {
+                    if evt.key() == Key::Escape {
+                        on_close.call(());
+                    }
+                },
+                onclick: move |evt| evt.stop_propagation(),
+                style: "width:min(1100px,100%);height:min(800px,100%);min-height:240px;background:var(--bg-surface-raised);border:1px solid var(--border-default);border-radius:var(--radius-lg);box-shadow:var(--shadow-lg);display:flex;flex-direction:column;overflow:hidden;",
+                div {
+                    style: "min-height:0;flex:1;position:relative;display:flex;align-items:center;justify-content:center;background:var(--bg-sunken);padding:16px;",
+                    if let Some(src) = display_src {
+                        img {
+                            src: "{src}",
+                            alt: "{attachment.name}",
+                            style: "display:block;max-width:100%;max-height:100%;object-fit:contain;",
+                        }
+                        if full_src.is_none() {
+                            div {
+                                style: "position:absolute;left:16px;bottom:16px;padding:6px 10px;border-radius:var(--radius-sm);background:rgba(0,0,0,0.72);color:white;font-size:12px;font-family:var(--font-mono);",
+                                "Loading full image…"
+                            }
+                        }
+                    } else {
+                        div {
+                            style: "display:flex;flex-direction:column;align-items:center;gap:10px;color:var(--text-tertiary);font-size:13px;",
+                            Icon { name: IconName::Image, size: 32 }
+                            "Loading full image…"
+                        }
+                    }
+                }
+                div {
+                    style: "display:flex;align-items:center;gap:12px;padding:12px 16px;border-top:1px solid var(--border-subtle);",
+                    div {
+                        style: "min-width:0;flex:1;",
+                        div { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:600;color:var(--text-primary);", "{attachment.name}" }
+                        div { style: "font-size:11px;color:var(--text-tertiary);font-family:var(--font-mono);", "{attachment.size}" }
+                    }
+                    button {
+                        onclick: {
+                            let attachment = attachment.clone();
+                            move |_| on_download.call(attachment.clone())
+                        },
+                        style: "height:36px;padding:0 14px;border:1px solid var(--border-default);border-radius:var(--radius-md);background:var(--bg-surface);color:var(--text-primary);cursor:pointer;display:flex;align-items:center;gap:8px;font-weight:600;",
+                        Icon { name: IconName::Download, size: 15 }
+                        "Download"
+                    }
+                    button {
+                        title: "Close image viewer",
+                        "aria-label": "Close image viewer",
+                        onclick: move |_| on_close.call(()),
+                        style: "width:36px;height:36px;border:1px solid var(--border-default);border-radius:var(--radius-md);background:transparent;color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;justify-content:center;",
+                        Icon { name: IconName::X, size: 17 }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 pub fn MessageRow(
     m: Message,
     /// Reply-quote lookup keyed by event id, shared Rc-wide across all rows
@@ -25,12 +107,12 @@ pub fn MessageRow(
     on_open_thread: EventHandler<String>,
     on_open_profile: EventHandler<String>,
     /// Download the full-resolution bytes of an attachment via a save
-    /// dialog (checkpoint 07). Also fired by clicking an inline image
-    /// (no lightbox in v1 — documented in docs/07).
+    /// dialog (checkpoint 07). Images expose this from their viewer.
     on_download: EventHandler<Attachment>,
 ) -> Element {
     let mut hover = use_signal(|| false);
     let mut show_emoji = use_signal(|| false);
+    let mut show_image = use_signal(|| false);
 
     // Inline image thumbnails (checkpoint 07): prefer the event's declared
     // thumbnail source, fall back to the media itself thumbed server-side.
@@ -139,11 +221,10 @@ pub fn MessageRow(
                                 (Some(w), Some(h)) if w > 0 && h > 0 => format!("aspect-ratio:{w}/{h};"),
                                 _ => String::new(),
                             };
-                            let att_dl = attachment.clone();
                             rsx! {
                                 button {
-                                    title: "Download full image",
-                                    onclick: move |_| on_download.call(att_dl.clone()),
+                                    title: "View full image",
+                                    onclick: move |_| show_image.set(true),
                                     style: "margin-top:6px;display:block;padding:0;border:1px solid var(--border-subtle);border-radius:var(--radius-md);overflow:hidden;background:var(--bg-surface-raised);cursor:pointer;max-width:440px;max-height:400px;",
                                     if let Some(src) = &img_src {
                                         img {
@@ -157,6 +238,14 @@ pub fn MessageRow(
                                         div { style: "{aspect}width:100%;min-width:200px;min-height:120px;display:flex;align-items:center;justify-content:center;color:var(--text-tertiary);",
                                             Icon { name: IconName::Image, size: 28 }
                                         }
+                                    }
+                                }
+                                if show_image() {
+                                    ImageViewer {
+                                        attachment: attachment.clone(),
+                                        preview_src: img_src.clone(),
+                                        on_close: move |_| show_image.set(false),
+                                        on_download,
                                     }
                                 }
                             }
