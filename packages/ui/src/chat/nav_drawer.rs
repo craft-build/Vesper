@@ -233,22 +233,28 @@ fn drawer_body(
                     }
                 }
             }
-            div { style: "padding:10px;border-top:1px solid var(--border-subtle);display:flex;gap:4px;",
+            // Match the composer's resting 77px footprint so both top borders
+            // form one continuous line across the app shell.
+            div { style: "height:77px;flex-shrink:0;padding:12px 10px;border-top:1px solid var(--border-subtle);display:flex;align-items:center;gap:6px;",
                 button {
                     onclick: move |_| on_open_discovery.call(()),
-                    style: "flex:1;display:flex;align-items:center;gap:6px;background:none;border:none;color:var(--text-secondary);cursor:pointer;padding:8px;border-radius:var(--radius-md);font-size:13px;",
-                    Icon { name: IconName::Plus, size: 15 }
+                    style: "height:40px;flex:1;display:flex;align-items:center;gap:8px;background:none;border:none;color:var(--text-secondary);cursor:pointer;padding:0 10px;border-radius:var(--radius-md);font-size:13px;font-weight:600;",
+                    Icon { name: IconName::Plus, size: 16 }
                     "Browse"
                 }
                 button {
                     onclick: move |_| on_open_settings.call(()),
-                    style: "background:none;border:none;color:var(--text-secondary);cursor:pointer;padding:8px;border-radius:var(--radius-md);display:flex;",
-                    Icon { name: IconName::Settings, size: 16 }
+                    title: "Settings",
+                    "aria-label": "Settings",
+                    style: "width:40px;height:40px;background:none;border:none;color:var(--text-secondary);cursor:pointer;padding:0;border-radius:var(--radius-md);display:flex;align-items:center;justify-content:center;",
+                    Icon { name: IconName::Settings, size: 17 }
                 }
                 button {
                     onclick: move |_| on_open_self.call(()),
-                    style: "background:none;border:none;color:var(--text-secondary);cursor:pointer;padding:8px;border-radius:var(--radius-md);display:flex;",
-                    Avatar { name: "You", size: 20, mxc: me_avatar.clone() }
+                    title: "Your profile",
+                    "aria-label": "Your profile",
+                    style: "width:40px;height:40px;background:none;border:none;color:var(--text-secondary);cursor:pointer;padding:0;border-radius:var(--radius-md);display:flex;align-items:center;justify-content:center;",
+                    Avatar { name: "You", size: 24, mxc: me_avatar.clone() }
                 }
             }
             // Right-click menu (checkpoint 09 leave flow). A transparent
