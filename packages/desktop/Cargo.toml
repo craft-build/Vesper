@@ -6,6 +6,11 @@ version = "0.1.0"
 edition = "2021"
 license.workspace = true
 
+[features]
+# Release bundles hide the extra Windows console without taking terminal logs
+# away from local `dx serve` development.
+bundle = []
+
 [dependencies]
 dioxus = { workspace = true, features = ["router", "desktop"] }
 ui = { workspace = true, features = ["desktop"] }

@@ -1,0 +1,12 @@
+[application]
+name = "vesper"
+default_platform = "android"
+out_dir = "dist"
+
+[bundle]
+identifier = "dev.vesper.app"
+publisher = "Vesper"
+category = "SocialNetworking"
+copyright = "Copyright (c) 2026 Vesper contributors"
+short_description = "Encrypted, federated chat on Matrix"
+long_description = "Vesper is a native Matrix client for encrypted, federated chat."

@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", feature = "bundle"),
+    windows_subsystem = "windows"
+)]
+
 use std::time::Instant;
 
 use dioxus::desktop::{Config, WindowBuilder};
