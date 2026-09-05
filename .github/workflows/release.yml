@@ -179,11 +179,23 @@ jobs:
           echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
           echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
-      # No release keystore is configured. Dioxus therefore uses Android's
-      # disposable debug key, which keeps the APK sideloadable without secrets.
-      - name: Build sideloadable APK (no release key)
+      # --release optimizes the Rust application. Without a release keystore,
+      # Dioxus wraps it in Android's debug-signed variant so it remains
+      # sideloadable without repository secrets.
+      - name: Build optimized sideloadable APK (debug-signed)
         working-directory: packages/mobile
         run: dx bundle --platform android --release --package-types apk --out-dir ../../release
+
+      - name: Name APK for release
+        shell: bash
+        run: |
+          shopt -s nullglob
+          apks=(release/*.apk)
+          if (( ${#apks[@]} != 1 )); then
+            echo "Expected exactly one APK, found ${#apks[@]}" >&2
+            exit 1
+          fi
+          mv "${apks[0]}" "release/Vesper_${RELEASE_TAG#v}_android.apk"
 
       - name: Stage APK
         uses: actions/upload-artifact@v4
