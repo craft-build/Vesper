@@ -23,9 +23,9 @@ title = "Vesper"
 
 [bundle]
 identifier = "dev.vesper.app"
-# The .icns ships as the bundle icon (CFBundleIconFile); regenerate
-# it from assets/icon.png with scripts/make-icns.sh.
-icon = ["assets/icon.icns"]
+# Linux/AppImage consumes the PNG while macOS consumes the ICNS. Regenerate
+# the ICNS from icon.png with scripts/make-icns.sh.
+icon = ["assets/icon.png", "assets/icon.icns"]
 publisher = "Vesper"
 category = "SocialNetworking"
 copyright = "Copyright (c) 2026 Vesper contributors"

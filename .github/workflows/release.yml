@@ -127,6 +127,17 @@ jobs:
         with:
           tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
 
+      # v0.1.0 configured only an ICNS icon. Keep manual rebuilds of that
+      # existing release working; newer tags already include both formats.
+      - name: Configure Linux bundle icon
+        shell: bash
+        run: |
+          sed -i \
+            's|icon = \["assets/icon.icns"\]|icon = ["assets/icon.png", "assets/icon.icns"]|' \
+            packages/desktop/Dioxus.toml
+          grep -F 'icon = ["assets/icon.png", "assets/icon.icns"]' \
+            packages/desktop/Dioxus.toml
+
       - name: Build AppImage
         working-directory: packages/desktop
         run: dx bundle --platform desktop --release --features bundle --target ${{ matrix.target }} --package-types appimage --out-dir ../../release
